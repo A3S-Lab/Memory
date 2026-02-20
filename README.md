@@ -1,6 +1,6 @@
 # a3s-memory
 
-Pluggable memory storage for AI agents.
+Pluggable memory storage for A3S.
 
 Provides the `MemoryStore` trait and two default implementations. Agents that need to persist and recall knowledge across sessions depend on this crate directly — nothing else required.
 
