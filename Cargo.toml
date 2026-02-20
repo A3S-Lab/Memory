@@ -1,0 +1,25 @@
+[package]
+name = "a3s-memory"
+version = "0.1.0"
+edition = "2021"
+authors = ["A3S Lab Team"]
+license = "MIT"
+repository = "https://github.com/A3S-Lab/Memory"
+description = "A3S Memory - Pluggable memory storage for AI agents"
+
+[lib]
+name = "a3s_memory"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["sync", "fs"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio = { version = "1", features = ["rt", "macros"] }
