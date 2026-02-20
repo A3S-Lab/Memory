@@ -149,15 +149,16 @@ impl MemoryItem {
         self.last_accessed = Some(Utc::now());
     }
 
-    /// Calculate relevance score at a given timestamp
-    pub fn relevance_score_at(&self, now: DateTime<Utc>) -> f32 {
+    /// Calculate relevance score at a given timestamp using the provided config
+    pub fn relevance_score_at(&self, now: DateTime<Utc>, config: &RelevanceConfig) -> f32 {
         let age_days = (now - self.timestamp).num_seconds() as f32 / 86400.0;
-        let decay = (-age_days / 30.0).exp();
-        self.importance * 0.7 + decay * 0.3
+        let decay = (-age_days / config.decay_days).exp();
+        self.importance * config.importance_weight + decay * config.recency_weight
     }
 
+    /// Calculate relevance score with default config
     pub fn relevance_score(&self) -> f32 {
-        self.relevance_score_at(Utc::now())
+        self.relevance_score_at(Utc::now(), &RelevanceConfig::default())
     }
 }
 
@@ -207,13 +208,142 @@ pub struct MemoryStats {
 // Shared helpers
 // ============================================================================
 
+/// Score an index entry for sorting (avoids loading full MemoryItem from disk)
+fn index_score(entry: &IndexEntry, now: DateTime<Utc>, config: &RelevanceConfig) -> f32 {
+    let age_days = (now - entry.timestamp).num_seconds() as f32 / 86400.0;
+    let decay = (-age_days / config.decay_days).exp();
+    entry.importance * config.importance_weight + decay * config.recency_weight
+}
+
 fn sort_by_relevance(items: &mut [MemoryItem]) {
     let now = Utc::now();
+    let config = RelevanceConfig::default();
     items.sort_by(|a, b| {
-        b.relevance_score_at(now)
-            .partial_cmp(&a.relevance_score_at(now))
+        b.relevance_score_at(now, &config)
+            .partial_cmp(&a.relevance_score_at(now, &config))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+}
+
+// ============================================================================
+// In-Memory Store
+// ============================================================================
+
+/// In-memory `MemoryStore` implementation.
+///
+/// Useful for testing and ephemeral (non-persistent) use cases.
+pub struct InMemoryStore {
+    items: RwLock<Vec<MemoryItem>>,
+}
+
+impl Default for InMemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InMemoryStore {
+    pub fn new() -> Self {
+        Self {
+            items: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MemoryStore for InMemoryStore {
+    async fn store(&self, item: MemoryItem) -> anyhow::Result<()> {
+        let mut items = self.items.write().await;
+        if let Some(pos) = items.iter().position(|i| i.id == item.id) {
+            items[pos] = item;
+        } else {
+            items.push(item);
+        }
+        Ok(())
+    }
+
+    async fn retrieve(&self, id: &str) -> anyhow::Result<Option<MemoryItem>> {
+        Ok(self.items.read().await.iter().find(|i| i.id == id).cloned())
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
+        let query_lower = query.to_lowercase();
+        let config = RelevanceConfig::default();
+        let now = Utc::now();
+        let items = self.items.read().await;
+        let mut matches: Vec<MemoryItem> = items
+            .iter()
+            .filter(|i| i.content_lower.contains(&query_lower))
+            .cloned()
+            .collect();
+        matches.sort_by(|a, b| {
+            b.relevance_score_at(now, &config)
+                .partial_cmp(&a.relevance_score_at(now, &config))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matches.truncate(limit);
+        Ok(matches)
+    }
+
+    async fn search_by_tags(
+        &self,
+        tags: &[String],
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryItem>> {
+        let config = RelevanceConfig::default();
+        let now = Utc::now();
+        let items = self.items.read().await;
+        let mut matches: Vec<MemoryItem> = items
+            .iter()
+            .filter(|i| tags.iter().any(|t| i.tags.contains(t)))
+            .cloned()
+            .collect();
+        matches.sort_by(|a, b| {
+            b.relevance_score_at(now, &config)
+                .partial_cmp(&a.relevance_score_at(now, &config))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matches.truncate(limit);
+        Ok(matches)
+    }
+
+    async fn get_recent(&self, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
+        let items = self.items.read().await;
+        let mut sorted: Vec<MemoryItem> = items.iter().cloned().collect();
+        sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        sorted.truncate(limit);
+        Ok(sorted)
+    }
+
+    async fn get_important(&self, threshold: f32, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
+        let items = self.items.read().await;
+        let mut matches: Vec<MemoryItem> = items
+            .iter()
+            .filter(|i| i.importance >= threshold)
+            .cloned()
+            .collect();
+        matches.sort_by(|a, b| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matches.truncate(limit);
+        Ok(matches)
+    }
+
+    async fn delete(&self, id: &str) -> anyhow::Result<()> {
+        self.items.write().await.retain(|i| i.id != id);
+        Ok(())
+    }
+
+    async fn clear(&self) -> anyhow::Result<()> {
+        self.items.write().await.clear();
+        Ok(())
+    }
+
+    async fn count(&self) -> anyhow::Result<usize> {
+        Ok(self.items.read().await.len())
+    }
 }
 
 // ============================================================================
@@ -375,16 +505,16 @@ impl MemoryStore for FileMemoryStore {
         let query_lower = query.to_lowercase();
         let index = self.index.read().await;
         let now = Utc::now();
+        let config = RelevanceConfig::default();
         let mut matches: Vec<&IndexEntry> = index
             .iter()
             .filter(|e| e.content_lower.contains(&query_lower))
             .collect();
         matches.sort_by(|a, b| {
-            let sa = a.importance * 0.7
-                + (-(now - a.timestamp).num_seconds() as f32 / 2592000.0).exp() * 0.3;
-            let sb = b.importance * 0.7
-                + (-(now - b.timestamp).num_seconds() as f32 / 2592000.0).exp() * 0.3;
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            index_score(a, now, &config)
+                .partial_cmp(&index_score(b, now, &config))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .reverse()
         });
         let ids: Vec<String> = matches.iter().take(limit).map(|e| e.id.clone()).collect();
         drop(index);
@@ -405,16 +535,16 @@ impl MemoryStore for FileMemoryStore {
     ) -> anyhow::Result<Vec<MemoryItem>> {
         let index = self.index.read().await;
         let now = Utc::now();
+        let config = RelevanceConfig::default();
         let mut matches: Vec<&IndexEntry> = index
             .iter()
             .filter(|e| tags.iter().any(|t| e.tags.contains(t)))
             .collect();
         matches.sort_by(|a, b| {
-            let sa = a.importance * 0.7
-                + (-(now - a.timestamp).num_seconds() as f32 / 2592000.0).exp() * 0.3;
-            let sb = b.importance * 0.7
-                + (-(now - b.timestamp).num_seconds() as f32 / 2592000.0).exp() * 0.3;
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            index_score(a, now, &config)
+                .partial_cmp(&index_score(b, now, &config))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .reverse()
         });
         let ids: Vec<String> = matches.iter().take(limit).map(|e| e.id.clone()).collect();
         drop(index);
@@ -504,88 +634,8 @@ impl MemoryStore for FileMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct TestMemoryStore {
-        items: std::sync::Mutex<Vec<MemoryItem>>,
-    }
 
-    impl TestMemoryStore {
-        fn new() -> Self {
-            Self {
-                items: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl MemoryStore for TestMemoryStore {
-        async fn store(&self, item: MemoryItem) -> anyhow::Result<()> {
-            self.items.lock().unwrap().push(item);
-            Ok(())
-        }
-        async fn retrieve(&self, id: &str) -> anyhow::Result<Option<MemoryItem>> {
-            Ok(self
-                .items
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|i| i.id == id)
-                .cloned())
-        }
-        async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
-            let items = self.items.lock().unwrap();
-            let q = query.to_lowercase();
-            Ok(items
-                .iter()
-                .filter(|i| i.content.to_lowercase().contains(&q))
-                .take(limit)
-                .cloned()
-                .collect())
-        }
-        async fn search_by_tags(
-            &self,
-            tags: &[String],
-            limit: usize,
-        ) -> anyhow::Result<Vec<MemoryItem>> {
-            let items = self.items.lock().unwrap();
-            Ok(items
-                .iter()
-                .filter(|i| tags.iter().any(|t| i.tags.contains(t)))
-                .take(limit)
-                .cloned()
-                .collect())
-        }
-        async fn get_recent(&self, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
-            let items = self.items.lock().unwrap();
-            let mut sorted: Vec<_> = items.iter().cloned().collect();
-            sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-            sorted.truncate(limit);
-            Ok(sorted)
-        }
-        async fn get_important(
-            &self,
-            threshold: f32,
-            limit: usize,
-        ) -> anyhow::Result<Vec<MemoryItem>> {
-            let items = self.items.lock().unwrap();
-            Ok(items
-                .iter()
-                .filter(|i| i.importance >= threshold)
-                .take(limit)
-                .cloned()
-                .collect())
-        }
-        async fn delete(&self, id: &str) -> anyhow::Result<()> {
-            self.items.lock().unwrap().retain(|i| i.id != id);
-            Ok(())
-        }
-        async fn clear(&self) -> anyhow::Result<()> {
-            self.items.lock().unwrap().clear();
-            Ok(())
-        }
-        async fn count(&self) -> anyhow::Result<usize> {
-            Ok(self.items.lock().unwrap().len())
-        }
-    }
+    // MemoryItem tests
 
     #[test]
     fn test_memory_item_creation() {
@@ -615,33 +665,8 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_item_relevance_recent() {
-        let item = MemoryItem::new("Test").with_importance(0.9);
-        assert!(item.relevance_score() > 0.6);
-    }
-
-    #[test]
-    fn test_relevance_config_defaults() {
-        let c = RelevanceConfig::default();
-        assert_eq!(c.decay_days, 30.0);
-        assert_eq!(c.importance_weight, 0.7);
-        assert_eq!(c.recency_weight, 0.3);
-    }
-
-    #[test]
-    fn test_memory_config_defaults() {
-        let c = MemoryConfig::default();
-        assert_eq!(c.max_short_term, 100);
-        assert_eq!(c.max_working, 10);
-    }
-
-    #[test]
-    fn test_memory_config_serde_roundtrip() {
-        let config = MemoryConfig::default();
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: MemoryConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.max_short_term, config.max_short_term);
-        assert_eq!(parsed.relevance.decay_days, config.relevance.decay_days);
+    fn test_memory_item_default_type_is_episodic() {
+        assert_eq!(MemoryItem::new("test").memory_type, MemoryType::Episodic);
     }
 
     #[test]
@@ -672,14 +697,81 @@ mod tests {
         );
     }
 
+    // relevance_score_at tests
+
     #[test]
-    fn test_memory_item_default_type_is_episodic() {
-        assert_eq!(MemoryItem::new("test").memory_type, MemoryType::Episodic);
+    fn test_relevance_score_uses_config() {
+        let item = MemoryItem::new("test").with_importance(1.0);
+        let now = Utc::now();
+
+        // High importance weight → score dominated by importance
+        let config_importance = RelevanceConfig {
+            decay_days: 30.0,
+            importance_weight: 0.9,
+            recency_weight: 0.1,
+        };
+        let score = item.relevance_score_at(now, &config_importance);
+        assert!(score > 0.95, "score was {score}");
+
+        // Short decay → recent item still scores well
+        let config_fast_decay = RelevanceConfig {
+            decay_days: 1.0,
+            importance_weight: 0.7,
+            recency_weight: 0.3,
+        };
+        let score2 = item.relevance_score_at(now, &config_fast_decay);
+        assert!(score2 > 0.9, "score was {score2}");
     }
 
+    #[test]
+    fn test_relevance_score_decays_with_age() {
+        let mut old_item = MemoryItem::new("old").with_importance(0.5);
+        old_item.timestamp = Utc::now() - chrono::Duration::days(60);
+        let config = RelevanceConfig::default(); // 30-day half-life
+        let score = old_item.relevance_score_at(Utc::now(), &config);
+        // After 60 days (2 half-lives), decay ≈ exp(-2) ≈ 0.135
+        // score ≈ 0.5*0.7 + 0.135*0.3 ≈ 0.39
+        assert!(score < 0.45, "score was {score}");
+    }
+
+    #[test]
+    fn test_relevance_score_default_uses_default_config() {
+        let item = MemoryItem::new("test").with_importance(0.9);
+        let score = item.relevance_score();
+        assert!(score > 0.6);
+    }
+
+    // RelevanceConfig / MemoryConfig tests
+
+    #[test]
+    fn test_relevance_config_defaults() {
+        let c = RelevanceConfig::default();
+        assert_eq!(c.decay_days, 30.0);
+        assert_eq!(c.importance_weight, 0.7);
+        assert_eq!(c.recency_weight, 0.3);
+    }
+
+    #[test]
+    fn test_memory_config_defaults() {
+        let c = MemoryConfig::default();
+        assert_eq!(c.max_short_term, 100);
+        assert_eq!(c.max_working, 10);
+    }
+
+    #[test]
+    fn test_memory_config_serde_roundtrip() {
+        let config = MemoryConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: MemoryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.max_short_term, config.max_short_term);
+        assert_eq!(parsed.relevance.decay_days, config.relevance.decay_days);
+    }
+
+    // InMemoryStore tests
+
     #[tokio::test]
-    async fn test_store_retrieve() {
-        let store = TestMemoryStore::new();
+    async fn test_in_memory_store_retrieve() {
+        let store = InMemoryStore::new();
         let item = MemoryItem::new("hello").with_tag("test");
         store.store(item.clone()).await.unwrap();
         let r = store.retrieve(&item.id).await.unwrap();
@@ -688,8 +780,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_and_tags() {
-        let store = TestMemoryStore::new();
+    async fn test_in_memory_store_retrieve_nonexistent() {
+        let store = InMemoryStore::new();
+        assert!(store.retrieve("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_store_upsert() {
+        let store = InMemoryStore::new();
+        let mut item = MemoryItem::new("original");
+        let id = item.id.clone();
+        store.store(item.clone()).await.unwrap();
+        item.content = "updated".to_string();
+        item.content_lower = "updated".to_string();
+        store.store(item).await.unwrap();
+        assert_eq!(store.count().await.unwrap(), 1);
+        assert_eq!(
+            store.retrieve(&id).await.unwrap().unwrap().content,
+            "updated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_store_search_and_tags() {
+        let store = InMemoryStore::new();
         store
             .store(MemoryItem::new("create file").with_tag("file"))
             .await
@@ -714,8 +828,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_and_clear() {
-        let store = TestMemoryStore::new();
+    async fn test_in_memory_store_search_relevance_order() {
+        let store = InMemoryStore::new();
+        store
+            .store(MemoryItem::new("rust tip").with_importance(0.3))
+            .await
+            .unwrap();
+        store
+            .store(MemoryItem::new("rust trick").with_importance(0.9))
+            .await
+            .unwrap();
+        let results = store.search("rust", 10).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].importance >= results[1].importance);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_store_delete_and_clear() {
+        let store = InMemoryStore::new();
         let item = MemoryItem::new("to delete");
         let id = item.id.clone();
         store.store(item).await.unwrap();
@@ -730,6 +860,44 @@ mod tests {
         }
         store.clear().await.unwrap();
         assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_store_get_recent() {
+        let store = InMemoryStore::new();
+        for i in 0..5 {
+            let mut item = MemoryItem::new(format!("item {i}"));
+            item.timestamp = Utc::now() + chrono::Duration::seconds(i as i64);
+            store.store(item).await.unwrap();
+        }
+        let recent = store.get_recent(3).await.unwrap();
+        assert_eq!(recent.len(), 3);
+        assert!(recent[0].timestamp >= recent[1].timestamp);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_store_get_important() {
+        let store = InMemoryStore::new();
+        store
+            .store(MemoryItem::new("low").with_importance(0.2))
+            .await
+            .unwrap();
+        store
+            .store(MemoryItem::new("high").with_importance(0.9))
+            .await
+            .unwrap();
+        store
+            .store(MemoryItem::new("medium").with_importance(0.5))
+            .await
+            .unwrap();
+        let results = store.get_important(0.7, 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "high");
+    }
+
+    #[test]
+    fn test_in_memory_store_default() {
+        let _store: InMemoryStore = InMemoryStore::default();
     }
 }
 
