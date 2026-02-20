@@ -50,37 +50,6 @@ impl Default for RelevanceConfig {
     }
 }
 
-/// Configuration for the agent memory system
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryConfig {
-    #[serde(default)]
-    pub relevance: RelevanceConfig,
-    #[serde(default = "MemoryConfig::default_max_short_term")]
-    pub max_short_term: usize,
-    #[serde(default = "MemoryConfig::default_max_working")]
-    pub max_working: usize,
-}
-
-impl MemoryConfig {
-    fn default_max_short_term() -> usize {
-        100
-    }
-    fn default_max_working() -> usize {
-        10
-    }
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            relevance: RelevanceConfig::default(),
-            max_short_term: 100,
-            max_working: 10,
-        }
-    }
-}
-
 // ============================================================================
 // Memory Item
 // ============================================================================
@@ -191,17 +160,6 @@ pub trait MemoryStore: Send + Sync {
     async fn delete(&self, id: &str) -> anyhow::Result<()>;
     async fn clear(&self) -> anyhow::Result<()>;
     async fn count(&self) -> anyhow::Result<usize>;
-}
-
-// ============================================================================
-// Memory Stats
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryStats {
-    pub long_term_count: usize,
-    pub short_term_count: usize,
-    pub working_count: usize,
 }
 
 // ============================================================================
@@ -741,7 +699,7 @@ mod tests {
         assert!(score > 0.6);
     }
 
-    // RelevanceConfig / MemoryConfig tests
+    // RelevanceConfig tests
 
     #[test]
     fn test_relevance_config_defaults() {
@@ -749,22 +707,6 @@ mod tests {
         assert_eq!(c.decay_days, 30.0);
         assert_eq!(c.importance_weight, 0.7);
         assert_eq!(c.recency_weight, 0.3);
-    }
-
-    #[test]
-    fn test_memory_config_defaults() {
-        let c = MemoryConfig::default();
-        assert_eq!(c.max_short_term, 100);
-        assert_eq!(c.max_working, 10);
-    }
-
-    #[test]
-    fn test_memory_config_serde_roundtrip() {
-        let config = MemoryConfig::default();
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: MemoryConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.max_short_term, config.max_short_term);
-        assert_eq!(parsed.relevance.decay_days, config.relevance.decay_days);
     }
 
     // InMemoryStore tests
