@@ -11,14 +11,26 @@ description = "A3S Memory - Pluggable memory storage for AI agents"
 name = "a3s_memory"
 path = "src/lib.rs"
 
+[features]
+# SQLite-backed store with FTS5 full-text search
+sqlite = ["dep:rusqlite"]
+# Vector-similarity search via sqlite-vec (requires sqlite feature)
+sqlite-vec = ["sqlite", "dep:sqlite-vec"]
+
 [dependencies]
 async-trait = "0.1"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["sync", "fs"] }
+tokio = { version = "1", features = ["sync", "fs", "rt", "io-util"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# SQLite (bundled build includes FTS5; optional)
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+# Vector extension for semantic search (optional)
+sqlite-vec = { version = "0.1.7-alpha.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"

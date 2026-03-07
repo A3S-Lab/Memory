@@ -1,7 +1,18 @@
 //! A3S Memory — pluggable memory storage for AI agents.
 //!
 //! Provides the `MemoryStore` trait, `MemoryItem`, `MemoryType`,
-//! configuration types, and a `FileMemoryStore` default implementation.
+//! configuration types, a `FileMemoryStore` default implementation, and
+//! (with the `sqlite` feature) a `SqliteMemoryStore` backed by SQLite with
+//! FTS5 full-text search.
+
+/// SQLite-backed memory store with dual-track Markdown export.
+///
+/// Requires the `sqlite` Cargo feature.
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteMemoryStore;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
