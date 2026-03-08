@@ -69,6 +69,7 @@ impl SqliteMemoryStore {
 
             #[cfg(feature = "sqlite-vec")]
             // SAFETY: transmute of a C function pointer to the expected auto-extension signature.
+            #[allow(clippy::missing_transmute_annotations)]
             unsafe {
                 rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
                     sqlite_vec::sqlite3_vec_init as *const (),
@@ -349,8 +350,6 @@ impl MemoryStore for SqliteMemoryStore {
         // SQLite's json_each() lets us do set membership without extensions.
         let conn = self.conn.clone();
         let tags_owned: Vec<String> = tags.to_vec();
-        let limit = limit;
-
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryItem>> {
             let c = conn.lock().expect("sqlite lock poisoned");
 

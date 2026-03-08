@@ -2,8 +2,8 @@
 //!
 //! Two files are maintained alongside the SQLite database:
 //!
-//! - `MEMORY.md`                 — append-only log for high-importance items
-//!                                  (importance ≥ `IMPORTANT_THRESHOLD`)
+//! - `MEMORY.md` — append-only log for high-importance items
+//!   (importance ≥ `IMPORTANT_THRESHOLD`)
 //! - `memory/YYYY-MM-DD.md`      — daily diary for `Episodic` memory items
 //!
 //! Both files are **append-only** — entries are never removed or rewritten.
@@ -94,7 +94,7 @@ pub fn list_files(base_dir: &Path) -> Vec<PathBuf> {
     if let Ok(rd) = std::fs::read_dir(&daily_dir) {
         for entry in rd.flatten() {
             let p = entry.path();
-            if p.extension().map_or(false, |e| e == "md") {
+            if p.extension().is_some_and(|e| e == "md") {
                 out.push(p);
             }
         }
