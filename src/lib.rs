@@ -61,6 +61,42 @@ impl Default for RelevanceConfig {
     }
 }
 
+/// Policy controlling automatic pruning of long-term memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrunePolicy {
+    /// Items older than this many days AND below `min_importance_to_keep` are deleted (default: 90).
+    #[serde(default = "PrunePolicy::default_max_age_days")]
+    pub max_age_days: u32,
+    /// Items with importance below this threshold are eligible for age-based deletion (default: 0.5).
+    /// High-importance items are never age-pruned.
+    #[serde(default = "PrunePolicy::default_min_importance_to_keep")]
+    pub min_importance_to_keep: f32,
+    /// Hard cap on total items; when exceeded, lowest-relevance items are removed.
+    /// 0 means unlimited (default: 0).
+    #[serde(default)]
+    pub max_items: usize,
+}
+
+impl PrunePolicy {
+    fn default_max_age_days() -> u32 {
+        90
+    }
+    fn default_min_importance_to_keep() -> f32 {
+        0.5
+    }
+}
+
+impl Default for PrunePolicy {
+    fn default() -> Self {
+        Self {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 0,
+        }
+    }
+}
+
 // ============================================================================
 // Memory Item
 // ============================================================================
@@ -171,6 +207,15 @@ pub trait MemoryStore: Send + Sync {
     async fn delete(&self, id: &str) -> anyhow::Result<()>;
     async fn clear(&self) -> anyhow::Result<()>;
     async fn count(&self) -> anyhow::Result<usize>;
+
+    /// Remove stale or excess items according to `policy`.
+    ///
+    /// Returns the number of items deleted. The default implementation is a
+    /// no-op (returns 0) for backwards compatibility.
+    async fn prune(&self, policy: &PrunePolicy) -> anyhow::Result<usize> {
+        let _ = policy;
+        Ok(0)
+    }
 }
 
 // ============================================================================
@@ -312,6 +357,31 @@ impl MemoryStore for InMemoryStore {
 
     async fn count(&self) -> anyhow::Result<usize> {
         Ok(self.items.read().await.len())
+    }
+
+    async fn prune(&self, policy: &PrunePolicy) -> anyhow::Result<usize> {
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::days(policy.max_age_days as i64);
+        let min_importance = policy.min_importance_to_keep;
+
+        let mut items = self.items.write().await;
+        let before = items.len();
+
+        // Phase 1: remove items that are both old and below the importance threshold.
+        items.retain(|item| item.importance >= min_importance || item.timestamp >= cutoff);
+
+        // Phase 2: if still over the cap, keep the highest-relevance items.
+        if policy.max_items > 0 && items.len() > policy.max_items {
+            let config = RelevanceConfig::default();
+            items.sort_by(|a, b| {
+                b.relevance_score_at(now, &config)
+                    .partial_cmp(&a.relevance_score_at(now, &config))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            items.truncate(policy.max_items);
+        }
+
+        Ok(before - items.len())
     }
 }
 
@@ -594,6 +664,54 @@ impl MemoryStore for FileMemoryStore {
     async fn count(&self) -> anyhow::Result<usize> {
         Ok(self.index.read().await.len())
     }
+
+    async fn prune(&self, policy: &PrunePolicy) -> anyhow::Result<usize> {
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::days(policy.max_age_days as i64);
+        let min_importance = policy.min_importance_to_keep;
+
+        // Phase 1: collect IDs that are old AND below the importance threshold.
+        let phase1_ids: Vec<String> = {
+            let index = self.index.read().await;
+            index
+                .iter()
+                .filter(|e| e.importance < min_importance && e.timestamp < cutoff)
+                .map(|e| e.id.clone())
+                .collect()
+        };
+        let mut deleted = phase1_ids.len();
+        for id in &phase1_ids {
+            self.delete(id).await?;
+        }
+
+        // Phase 2: enforce max_items cap by removing lowest-relevance items.
+        if policy.max_items > 0 {
+            let config = RelevanceConfig::default();
+            let phase2_ids: Vec<String> = {
+                let index = self.index.read().await;
+                if index.len() <= policy.max_items {
+                    Vec::new()
+                } else {
+                    let mut entries: Vec<&IndexEntry> = index.iter().collect();
+                    entries.sort_by(|a, b| {
+                        index_score(b, now, &config)
+                            .partial_cmp(&index_score(a, now, &config))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    entries[policy.max_items..]
+                        .iter()
+                        .map(|e| e.id.clone())
+                        .collect()
+                }
+            };
+            deleted += phase2_ids.len();
+            for id in &phase2_ids {
+                self.delete(id).await?;
+            }
+        }
+
+        Ok(deleted)
+    }
 }
 
 // ============================================================================
@@ -852,6 +970,88 @@ mod tests {
     fn test_in_memory_store_default() {
         let _store: InMemoryStore = InMemoryStore::default();
     }
+
+    // PrunePolicy / prune() tests
+
+    #[test]
+    fn test_prune_policy_defaults() {
+        let p = PrunePolicy::default();
+        assert_eq!(p.max_age_days, 90);
+        assert_eq!(p.min_importance_to_keep, 0.5);
+        assert_eq!(p.max_items, 0);
+    }
+
+    #[tokio::test]
+    async fn test_prune_removes_old_low_importance() {
+        let store = InMemoryStore::new();
+        let mut old_item = MemoryItem::new("stale memory").with_importance(0.2);
+        old_item.timestamp = Utc::now() - chrono::Duration::days(100);
+        store.store(old_item).await.unwrap();
+
+        let policy = PrunePolicy {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 0,
+        };
+        let deleted = store.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prune_keeps_high_importance() {
+        let store = InMemoryStore::new();
+        let mut old_item = MemoryItem::new("important memory").with_importance(0.9);
+        old_item.timestamp = Utc::now() - chrono::Duration::days(100);
+        store.store(old_item).await.unwrap();
+
+        let policy = PrunePolicy {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 0,
+        };
+        let deleted = store.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(store.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prune_max_items() {
+        let store = InMemoryStore::new();
+        for i in 0..10 {
+            store
+                .store(MemoryItem::new(format!("item {i}")).with_importance(i as f32 * 0.1))
+                .await
+                .unwrap();
+        }
+        let policy = PrunePolicy {
+            max_age_days: 9999,
+            min_importance_to_keep: 0.0,
+            max_items: 5,
+        };
+        let deleted = store.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 5);
+        assert_eq!(store.count().await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_prune_keeps_recent_low_importance() {
+        // A recent item with low importance should NOT be pruned (not old enough)
+        let store = InMemoryStore::new();
+        store
+            .store(MemoryItem::new("fresh").with_importance(0.1))
+            .await
+            .unwrap();
+
+        let policy = PrunePolicy {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 0,
+        };
+        let deleted = store.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(store.count().await.unwrap(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1062,5 +1262,58 @@ mod file_memory_store_tests {
         let results = store.get_important(0.5, 10).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "high");
+    }
+
+    #[tokio::test]
+    async fn test_file_prune_removes_old_low_importance() {
+        let (_dir, store) = setup().await;
+        let mut old_item = MemoryItem::new("stale").with_importance(0.2);
+        old_item.timestamp = Utc::now() - chrono::Duration::days(100);
+        store.store(old_item).await.unwrap();
+
+        let policy = PrunePolicy {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 0,
+        };
+        let deleted = store.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_file_prune_keeps_high_importance() {
+        let (_dir, store) = setup().await;
+        let mut old_item = MemoryItem::new("important").with_importance(0.9);
+        old_item.timestamp = Utc::now() - chrono::Duration::days(100);
+        store.store(old_item).await.unwrap();
+
+        let policy = PrunePolicy {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 0,
+        };
+        let deleted = store.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(store.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_file_prune_max_items() {
+        let (_dir, store) = setup().await;
+        for i in 0..10 {
+            store
+                .store(MemoryItem::new(format!("item {i}")).with_importance(i as f32 * 0.1))
+                .await
+                .unwrap();
+        }
+        let policy = PrunePolicy {
+            max_age_days: 9999,
+            min_importance_to_keep: 0.0,
+            max_items: 5,
+        };
+        let deleted = store.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 5);
+        assert_eq!(store.count().await.unwrap(), 5);
     }
 }

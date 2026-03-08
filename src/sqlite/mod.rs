@@ -24,7 +24,7 @@
 pub mod markdown;
 pub mod schema;
 
-use crate::{MemoryItem, MemoryStore, MemoryType, RelevanceConfig};
+use crate::{MemoryItem, MemoryStore, MemoryType, PrunePolicy, RelevanceConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -129,10 +129,7 @@ impl SqliteMemoryStore {
     }
 
     /// Return all session-log rows for `session_id` as JSON values, oldest first.
-    pub async fn export_session_log(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<serde_json::Value>> {
+    pub async fn export_session_log(&self, session_id: &str) -> Result<Vec<serde_json::Value>> {
         let session_id = session_id.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>> {
@@ -153,8 +150,8 @@ impl SqliteMemoryStore {
             let mut out = Vec::new();
             for row in rows {
                 let (event_type, data_json, ts) = row?;
-                let data: serde_json::Value = serde_json::from_str(&data_json)
-                    .unwrap_or(serde_json::Value::Null);
+                let data: serde_json::Value =
+                    serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null);
                 out.push(serde_json::json!({
                     "event_type": event_type,
                     "data": data,
@@ -171,11 +168,7 @@ impl SqliteMemoryStore {
     ///
     /// Only available when the `sqlite-vec` Cargo feature is enabled.
     #[cfg(feature = "sqlite-vec")]
-    pub async fn store_with_embedding(
-        &self,
-        item: MemoryItem,
-        embedding: Vec<f32>,
-    ) -> Result<()> {
+    pub async fn store_with_embedding(&self, item: MemoryItem, embedding: Vec<f32>) -> Result<()> {
         // First store normally (FTS + Markdown)
         self.store(item.clone()).await?;
 
@@ -183,10 +176,7 @@ impl SqliteMemoryStore {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let c = conn.lock().expect("sqlite lock poisoned");
-            let blob: Vec<u8> = embedding
-                .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
+            let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
             c.execute(
                 "INSERT OR REPLACE INTO memories_vec (memory_id, embedding) VALUES (?1, ?2)",
                 params![id, blob],
@@ -446,9 +436,40 @@ impl MemoryStore for SqliteMemoryStore {
 
     async fn count(&self) -> Result<usize> {
         self.with_conn(move |c| {
-            let n: i64 =
-                c.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
             Ok(n as usize)
+        })
+        .await
+    }
+
+    async fn prune(&self, policy: &PrunePolicy) -> Result<usize> {
+        let cutoff_ms = (chrono::Utc::now() - chrono::Duration::days(policy.max_age_days as i64))
+            .timestamp_millis();
+        let min_importance = policy.min_importance_to_keep;
+        let max_items = policy.max_items;
+
+        self.with_conn(move |c| {
+            // Phase 1: delete items that are old AND below the importance threshold.
+            let deleted1 = c.execute(
+                "DELETE FROM memories WHERE timestamp_ms < ?1 AND importance < ?2",
+                params![cutoff_ms, min_importance],
+            )?;
+
+            // Phase 2: enforce hard item cap, keeping highest-importance/newest items.
+            let deleted2 = if max_items > 0 {
+                c.execute(
+                    "DELETE FROM memories WHERE id NOT IN (
+                         SELECT id FROM memories
+                         ORDER BY importance DESC, timestamp_ms DESC
+                         LIMIT ?1
+                     )",
+                    params![max_items as i64],
+                )?
+            } else {
+                0
+            };
+
+            Ok(deleted1 + deleted2)
         })
         .await
     }
@@ -490,7 +511,9 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
 }
 
 fn ms_to_dt(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 fn memory_type_to_str(t: &MemoryType) -> &'static str {
@@ -578,8 +601,12 @@ mod tests {
     async fn test_fts_search() {
         let dir = TempDir::new().unwrap();
         let s = store(&dir).await;
-        s.store(make_item("1", "The quick brown fox", 0.5)).await.unwrap();
-        s.store(make_item("2", "lazy dog barks", 0.5)).await.unwrap();
+        s.store(make_item("1", "The quick brown fox", 0.5))
+            .await
+            .unwrap();
+        s.store(make_item("2", "lazy dog barks", 0.5))
+            .await
+            .unwrap();
 
         let results = s.search("fox", 10).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -633,7 +660,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let s = store(&dir).await;
-            s.store(make_item("persist", "durable data", 0.6)).await.unwrap();
+            s.store(make_item("persist", "durable data", 0.6))
+                .await
+                .unwrap();
         }
         let s2 = SqliteMemoryStore::new(dir.path()).await.unwrap();
         let got = s2.retrieve("persist").await.unwrap();
@@ -676,6 +705,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prune_removes_old_low_importance() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir).await;
+
+        let mut old_item = make_item("old_low", "stale memory", 0.2);
+        // Force a timestamp 100 days in the past via direct insert
+        let cutoff_ms = (chrono::Utc::now() - chrono::Duration::days(100)).timestamp_millis();
+        {
+            let conn = s.conn.clone();
+            tokio::task::spawn_blocking(move || {
+                let c = conn.lock().unwrap();
+                c.execute(
+                    "UPDATE memories SET timestamp_ms = ?1 WHERE id = ?2",
+                    params![cutoff_ms, "old_low"],
+                )
+                .unwrap();
+            })
+            .await
+            .unwrap();
+        }
+        old_item.timestamp = chrono::Utc::now() - chrono::Duration::days(100);
+        s.store(old_item).await.unwrap();
+        // Update the timestamp to be in the past (store sets now)
+        {
+            let conn = s.conn.clone();
+            let ts = cutoff_ms - 1;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.lock().unwrap();
+                c.execute(
+                    "UPDATE memories SET timestamp_ms = ?1 WHERE id = 'old_low'",
+                    params![ts],
+                )
+                .unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        use crate::PrunePolicy;
+        let policy = PrunePolicy {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 0,
+        };
+        let deleted = s.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(s.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prune_keeps_high_importance() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir).await;
+        s.store(make_item("hi", "important", 0.9)).await.unwrap();
+        // Force old timestamp
+        {
+            let conn = s.conn.clone();
+            let ts = (chrono::Utc::now() - chrono::Duration::days(100)).timestamp_millis();
+            tokio::task::spawn_blocking(move || {
+                let c = conn.lock().unwrap();
+                c.execute(
+                    "UPDATE memories SET timestamp_ms = ?1 WHERE id = 'hi'",
+                    params![ts],
+                )
+                .unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        use crate::PrunePolicy;
+        let policy = PrunePolicy {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 0,
+        };
+        let deleted = s.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(s.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prune_max_items() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir).await;
+        for i in 0..10u32 {
+            s.store(make_item(
+                &format!("id{i}"),
+                &format!("content {i}"),
+                i as f32 * 0.1,
+            ))
+            .await
+            .unwrap();
+        }
+        use crate::PrunePolicy;
+        let policy = PrunePolicy {
+            max_age_days: 9999,
+            min_importance_to_keep: 0.0,
+            max_items: 5,
+        };
+        let deleted = s.prune(&policy).await.unwrap();
+        assert_eq!(deleted, 5);
+        assert_eq!(s.count().await.unwrap(), 5);
+    }
+
+    #[tokio::test]
     async fn test_markdown_episodic_daily_log() {
         let dir = TempDir::new().unwrap();
         let s = store(&dir).await;
@@ -690,8 +825,9 @@ mod tests {
         let mut has_today = false;
         if let Ok(mut rd) = tokio::fs::read_dir(&daily_dir).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
-                let content =
-                    tokio::fs::read_to_string(entry.path()).await.unwrap_or_default();
+                let content = tokio::fs::read_to_string(entry.path())
+                    .await
+                    .unwrap_or_default();
                 if content.contains("today's activity log") {
                     has_today = true;
                 }
