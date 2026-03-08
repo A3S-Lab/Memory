@@ -60,7 +60,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: cargo publish
-        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }} --allow-dirty
 
   release:
     name: GitHub Release
