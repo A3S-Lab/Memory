@@ -1,9 +1,14 @@
 //! A3S Memory — pluggable memory storage for AI agents.
 //!
 //! Provides the `MemoryStore` trait, `MemoryItem`, `MemoryType`,
-//! configuration types, a `FileMemoryStore` default implementation, and
-//! (with the `sqlite` feature) a `SqliteMemoryStore` backed by SQLite with
-//! FTS5 full-text search.
+//! configuration types, and the following backend implementations:
+//!
+//! | Backend | Feature | Search |
+//! |---------|---------|--------|
+//! | [`FileMemoryStore`] | always available | substring |
+//! | [`SqliteMemoryStore`] | `sqlite` | BM25 via FTS5 |
+//!
+//! The [`FileMemoryStore`] is the default and requires no additional dependencies.
 
 /// SQLite-backed memory store with dual-track Markdown export.
 ///
