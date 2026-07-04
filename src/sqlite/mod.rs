@@ -24,7 +24,10 @@
 pub mod markdown;
 pub mod schema;
 
-use crate::{MemoryItem, MemoryStore, MemoryType, PrunePolicy, RelevanceConfig};
+use crate::{
+    memories_are_store_duplicates, memory_is_prune_protected, merge_duplicate_memory_item,
+    normalize_item_for_store, MemoryItem, MemoryStore, MemoryType, PrunePolicy, RelevanceConfig,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -171,7 +174,7 @@ impl SqliteMemoryStore {
     #[cfg(feature = "sqlite-vec")]
     pub async fn store_with_embedding(&self, item: MemoryItem, embedding: Vec<f32>) -> Result<()> {
         // First store normally (FTS + Markdown)
-        self.store(item.clone()).await?;
+        let item = self.store_and_return(item).await?;
 
         let id = item.id.clone();
         let conn = self.conn.clone();
@@ -252,38 +255,48 @@ impl SqliteMemoryStore {
 #[async_trait]
 impl MemoryStore for SqliteMemoryStore {
     async fn store(&self, item: MemoryItem) -> Result<()> {
-        // Write to Markdown tracks (best-effort; DB is authoritative)
-        if let Err(e) = markdown::append(&self.base_dir, &item).await {
-            eprintln!("[a3s-memory] markdown write failed for {}: {e}", item.id);
+        self.store_and_return(item).await.map(|_| ())
+    }
+
+    async fn store_and_return(&self, item: MemoryItem) -> Result<MemoryItem> {
+        let item = normalize_item_for_store(item);
+        let (stored, append_markdown) = self
+            .with_conn(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, content, timestamp_ms, importance, tags, memory_type,
+                            metadata, access_count, last_accessed_ms
+                     FROM memories",
+                )?;
+                let existing_items: Vec<MemoryItem> = stmt
+                    .query_map([], row_to_item)?
+                    .filter_map(|row| row.ok())
+                    .collect();
+                if let Some(existing) = existing_items
+                    .into_iter()
+                    .find(|existing| memories_are_store_duplicates(existing, &item))
+                {
+                    if existing.id != item.id {
+                        let merged = merge_duplicate_memory_item(existing, item.clone());
+                        upsert_memory_item(c, &merged)?;
+                        if item.id != merged.id {
+                            c.execute("DELETE FROM memories WHERE id = ?1", params![item.id])?;
+                        }
+                        return Ok((merged, false));
+                    }
+                }
+
+                upsert_memory_item(c, &item)?;
+                Ok((item, true))
+            })
+            .await?;
+
+        if append_markdown {
+            if let Err(e) = markdown::append(&self.base_dir, &stored).await {
+                eprintln!("[a3s-memory] markdown write failed for {}: {e}", stored.id);
+            }
         }
 
-        let tags_json = serde_json::to_string(&item.tags)?;
-        let meta_json = serde_json::to_string(&item.metadata)?;
-        let ts_ms = item.timestamp.timestamp_millis();
-        let last_acc_ms = item.last_accessed.map(|t| t.timestamp_millis());
-        let mtype = memory_type_to_str(&item.memory_type).to_string();
-
-        self.with_conn(move |c| {
-            c.execute(
-                "INSERT OR REPLACE INTO memories
-                 (id, content, timestamp_ms, importance, tags, memory_type, metadata,
-                  access_count, last_accessed_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    item.id,
-                    item.content,
-                    ts_ms,
-                    item.importance,
-                    tags_json,
-                    mtype,
-                    meta_json,
-                    item.access_count,
-                    last_acc_ms,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
+        Ok(stored)
     }
 
     async fn retrieve(&self, id: &str) -> Result<Option<MemoryItem>> {
@@ -446,32 +459,90 @@ impl MemoryStore for SqliteMemoryStore {
             .timestamp_millis();
         let min_importance = policy.min_importance_to_keep;
         let max_items = policy.max_items;
+        let now = chrono::Utc::now();
 
         self.with_conn(move |c| {
-            // Phase 1: delete items that are old AND below the importance threshold.
-            let deleted1 = c.execute(
-                "DELETE FROM memories WHERE timestamp_ms < ?1 AND importance < ?2",
-                params![cutoff_ms, min_importance],
+            let mut stmt = c.prepare(
+                "SELECT id, content, timestamp_ms, importance, tags, memory_type,
+                        metadata, access_count, last_accessed_ms
+                 FROM memories",
             )?;
+            let mut items: Vec<MemoryItem> = stmt
+                .query_map([], row_to_item)?
+                .filter_map(|row| row.ok())
+                .collect();
 
-            // Phase 2: enforce hard item cap, keeping highest-importance/newest items.
-            let deleted2 = if max_items > 0 {
-                c.execute(
-                    "DELETE FROM memories WHERE id NOT IN (
-                         SELECT id FROM memories
-                         ORDER BY importance DESC, timestamp_ms DESC
-                         LIMIT ?1
-                     )",
-                    params![max_items as i64],
-                )?
-            } else {
-                0
-            };
+            let mut delete_ids: Vec<String> = items
+                .iter()
+                .filter(|item| {
+                    !memory_is_prune_protected(item)
+                        && item.timestamp.timestamp_millis() < cutoff_ms
+                        && item.importance < min_importance
+                })
+                .map(|item| item.id.clone())
+                .collect();
 
-            Ok(deleted1 + deleted2)
+            items.retain(|item| !delete_ids.contains(&item.id));
+
+            if max_items > 0 && items.len() > max_items {
+                let protected_count = items
+                    .iter()
+                    .filter(|item| memory_is_prune_protected(item))
+                    .count();
+                let unprotected_to_keep = max_items.saturating_sub(protected_count);
+                let mut unprotected: Vec<MemoryItem> = items
+                    .into_iter()
+                    .filter(|item| !memory_is_prune_protected(item))
+                    .collect();
+                unprotected.sort_by(|a, b| {
+                    b.relevance_score_at(now, &RelevanceConfig::default())
+                        .partial_cmp(&a.relevance_score_at(now, &RelevanceConfig::default()))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                delete_ids.extend(
+                    unprotected
+                        .into_iter()
+                        .skip(unprotected_to_keep)
+                        .map(|item| item.id),
+                );
+            }
+
+            let deleted = delete_ids.len();
+            for id in delete_ids {
+                c.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+            }
+
+            Ok(deleted)
         })
         .await
     }
+}
+
+fn upsert_memory_item(c: &Connection, item: &MemoryItem) -> Result<()> {
+    let tags_json = serde_json::to_string(&item.tags)?;
+    let meta_json = serde_json::to_string(&item.metadata)?;
+    let ts_ms = item.timestamp.timestamp_millis();
+    let last_acc_ms = item.last_accessed.map(|t| t.timestamp_millis());
+    let mtype = memory_type_to_str(&item.memory_type).to_string();
+
+    c.execute(
+        "INSERT OR REPLACE INTO memories
+         (id, content, timestamp_ms, importance, tags, memory_type, metadata,
+          access_count, last_accessed_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            item.id,
+            item.content,
+            ts_ms,
+            item.importance,
+            tags_json,
+            mtype,
+            meta_json,
+            item.access_count,
+            last_acc_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 // ── Row deserialization ──────────────────────────────────────────────────────
@@ -631,6 +702,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_deduplicates_durable_content() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir).await;
+
+        let mut first = make_item(
+            "first",
+            "Run focused memory extraction tests after parser changes.",
+            0.3,
+        );
+        first.tags = vec!["memory".to_string()];
+        s.store(first).await.unwrap();
+
+        let mut duplicate = make_item(
+            "duplicate",
+            "run focused MEMORY extraction tests after parser changes!",
+            0.9,
+        );
+        duplicate.tags = vec!["tests".to_string()];
+        duplicate
+            .metadata
+            .insert("supersedes".to_string(), "old-memory".to_string());
+        let stored = s.store_and_return(duplicate).await.unwrap();
+
+        assert_eq!(stored.id, "first");
+        assert_eq!(s.count().await.unwrap(), 1);
+        let recalled = s.retrieve("first").await.unwrap().unwrap();
+        assert_eq!(recalled.importance, 0.9);
+        assert!(recalled.tags.contains(&"memory".to_string()));
+        assert!(recalled.tags.contains(&"tests".to_string()));
+        assert_eq!(
+            recalled.metadata.get("duplicate_count").map(String::as_str),
+            Some("1")
+        );
+        assert!(s.retrieve("duplicate").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_store_merges_near_duplicate_content() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir).await;
+
+        let mut first = make_item(
+            "first",
+            "Run focused memory store tests after parser changes.",
+            0.35,
+        );
+        first.memory_type = MemoryType::Procedural;
+        first.tags = vec!["memory".to_string()];
+        s.store(first).await.unwrap();
+
+        let mut duplicate = make_item(
+            "duplicate",
+            "Run focused memory store regression tests after parser changes.",
+            0.9,
+        );
+        duplicate.memory_type = MemoryType::Procedural;
+        duplicate.tags = vec!["tests".to_string()];
+        let stored = s.store_and_return(duplicate).await.unwrap();
+
+        assert_eq!(stored.id, "first");
+        assert_eq!(s.count().await.unwrap(), 1);
+        let recalled = s.retrieve("first").await.unwrap().unwrap();
+        assert!(recalled.content.contains("regression tests"));
+        assert!(recalled.tags.contains(&"memory".to_string()));
+        assert!(recalled.tags.contains(&"tests".to_string()));
+        assert_eq!(
+            recalled.metadata.get("duplicate_count").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_keeps_conflicting_near_duplicate_content() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir).await;
+
+        s.store(make_item(
+            "use",
+            "Use file memory store for local sessions.",
+            0.5,
+        ))
+        .await
+        .unwrap();
+        s.store(make_item(
+            "avoid",
+            "Do not use file memory store for local sessions.",
+            0.5,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(s.count().await.unwrap(), 2);
+        assert!(s.retrieve("use").await.unwrap().is_some());
+        assert!(s.retrieve("avoid").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn test_get_important() {
         let dir = TempDir::new().unwrap();
         let s = store(&dir).await;
@@ -751,6 +919,53 @@ mod tests {
         let deleted = s.prune(&policy).await.unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(s.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prune_protects_curated_memories() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir).await;
+
+        let mut pinned = make_item("pinned", "Pinned low-importance memory.", 0.1);
+        pinned.tags = vec!["pinned".to_string()];
+        pinned.timestamp = chrono::Utc::now() - chrono::Duration::days(120);
+        s.store(pinned).await.unwrap();
+
+        let mut accessed = make_item(
+            "accessed",
+            "Frequently recalled low-importance memory.",
+            0.1,
+        );
+        accessed.timestamp = chrono::Utc::now() - chrono::Duration::days(120);
+        accessed.record_access();
+        accessed.record_access();
+        accessed.record_access();
+        s.store(accessed).await.unwrap();
+
+        let mut related = make_item("related", "Conflict memory should remain auditable.", 0.1);
+        related.timestamp = chrono::Utc::now() - chrono::Duration::days(120);
+        related
+            .metadata
+            .insert("conflicts_with".to_string(), "legacy-memory".to_string());
+        s.store(related).await.unwrap();
+
+        let mut stale = make_item("stale", "Unprotected stale memory.", 0.1);
+        stale.timestamp = chrono::Utc::now() - chrono::Duration::days(120);
+        s.store(stale).await.unwrap();
+
+        let policy = PrunePolicy {
+            max_age_days: 90,
+            min_importance_to_keep: 0.5,
+            max_items: 2,
+        };
+        let deleted = s.prune(&policy).await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(s.count().await.unwrap(), 3);
+        assert!(s.retrieve("pinned").await.unwrap().is_some());
+        assert!(s.retrieve("accessed").await.unwrap().is_some());
+        assert!(s.retrieve("related").await.unwrap().is_some());
+        assert!(s.retrieve("stale").await.unwrap().is_none());
     }
 
     #[tokio::test]

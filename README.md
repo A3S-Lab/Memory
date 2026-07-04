@@ -4,6 +4,11 @@ Pluggable memory storage for A3S.
 
 Provides the `MemoryStore` trait and two default implementations. Agents that need to persist and recall knowledge across sessions depend on this crate directly — nothing else required.
 
+Default stores also enforce a small amount of memory hygiene: exact and
+conservative near-duplicate durable content is merged into the existing item,
+tags/metadata/importance are consolidated, and pruning protects curated memories
+such as pinned, frequently recalled, consolidated, or conflict-tracking items.
+
 ## Design
 
 The crate follows a minimal core + external extensions pattern:
@@ -77,6 +82,11 @@ impl MemoryStore for MyStore {
 
 ## Relevance scoring
 
+Search combines lexical match strength (exact phrase, term, tag, and memory-type
+matches) with the relevance score below. Exact or more specific query matches are
+kept ahead of generic high-importance memories, while equally specific results
+still benefit from importance and recency.
+
 ```
 score = importance × importance_weight + decay × recency_weight
 decay = exp(−age_days / decay_days)
@@ -96,6 +106,26 @@ let config = RelevanceConfig {
 let score = item.relevance_score_at(now, &config);
 ```
 
+## Deduplication and pruning
+
+`InMemoryStore`, `FileMemoryStore`, and the optional SQLite store collapse exact
+durable duplicates by a punctuation-insensitive content fingerprint. They also
+merge conservative near-duplicates when the memory type matches, enough
+non-stopword terms overlap, and the contents do not have conflicting negation
+polarity. The first memory id remains canonical; later duplicates raise
+importance, merge tags and list-style metadata such as `supersedes` /
+`conflicts_with`, and record `duplicate_count` metadata.
+
+Use `MemoryStore::store_and_return()` when the caller needs the canonical item
+that now represents the fact. Callers that detect their own near-duplicates can
+also use `MemoryItem::merge_duplicate()` and then store the returned canonical
+item.
+
+`PrunePolicy` removes old, low-importance items and can enforce a maximum item
+count, but it hard-protects curated memories: `keep` / `pinned` / `protected`
+tags or metadata, repeatedly accessed items, and memories carrying
+`supersedes` / `conflicts_with` relation metadata.
+
 ## What this crate does NOT own
 
 | Concern | Lives in |
@@ -107,7 +137,12 @@ let score = item.relevance_score_at(now, &config);
 
 ## Tests
 
-32 tests covering `MemoryItem`, `RelevanceConfig`, `InMemoryStore`, and `FileMemoryStore` (including persistence, index rebuild, and path traversal prevention).
+89 default tests covering `MemoryItem`, `RelevanceConfig`, `InMemoryStore`, and
+`FileMemoryStore` (including persistence, index rebuild, path traversal
+prevention, search specificity, duplicate consolidation, conservative
+near-duplicate merging, conflict-safe deduplication, and protected pruning).
+With the `sqlite` feature enabled, the suite covers 108 tests including the
+SQLite backend contract.
 
 ```sh
 cargo test

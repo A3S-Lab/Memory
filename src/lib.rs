@@ -22,8 +22,14 @@ pub use sqlite::SqliteMemoryStore;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use tokio::sync::RwLock;
+
+const MIN_DEDUPE_FINGERPRINT_CHARS: usize = 24;
+const MIN_NEAR_DEDUPE_TERMS: usize = 5;
+const NEAR_DEDUPE_JACCARD_THRESHOLD: f32 = 0.86;
+const PRUNE_PROTECTED_ACCESS_COUNT: u32 = 3;
 
 // ============================================================================
 // Configuration
@@ -165,6 +171,23 @@ impl MemoryItem {
         self
     }
 
+    /// Stable, punctuation-insensitive content fingerprint used by default
+    /// stores to collapse exact durable duplicates.
+    ///
+    /// Very short memories return `None` so generic fragments such as "ok" or
+    /// "done" are not accidentally merged.
+    pub fn content_fingerprint(&self) -> Option<String> {
+        memory_content_fingerprint(&self.content)
+    }
+
+    /// Merge a later duplicate observation into this canonical memory item.
+    ///
+    /// The canonical id is preserved while importance, tags, list-style
+    /// metadata, access stats, and duplicate audit metadata are consolidated.
+    pub fn merge_duplicate(self, incoming: MemoryItem) -> MemoryItem {
+        merge_duplicate_memory_item(self, incoming)
+    }
+
     pub fn record_access(&mut self) {
         self.access_count += 1;
         self.last_accessed = Some(Utc::now());
@@ -181,6 +204,285 @@ impl MemoryItem {
     pub fn relevance_score(&self) -> f32 {
         self.relevance_score_at(Utc::now(), &RelevanceConfig::default())
     }
+}
+
+fn normalize_item_for_store(mut item: MemoryItem) -> MemoryItem {
+    item.content_lower = item.content.to_lowercase();
+    item
+}
+
+fn memory_content_fingerprint(content: &str) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in content.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    let fingerprint = tokens.join(" ");
+    if fingerprint.chars().count() < MIN_DEDUPE_FINGERPRINT_CHARS {
+        None
+    } else {
+        Some(fingerprint)
+    }
+}
+
+fn memories_are_store_duplicates(existing: &MemoryItem, incoming: &MemoryItem) -> bool {
+    if existing.id == incoming.id {
+        return true;
+    }
+    if existing.content_fingerprint().is_some()
+        && existing.content_fingerprint() == incoming.content_fingerprint()
+    {
+        return true;
+    }
+    memory_items_are_near_duplicates(existing, incoming)
+}
+
+fn memory_index_entry_is_duplicate(entry: &IndexEntry, incoming: &MemoryItem) -> bool {
+    if entry.id == incoming.id {
+        return true;
+    }
+    if incoming.content_fingerprint().is_some()
+        && memory_content_fingerprint(&entry.content_lower) == incoming.content_fingerprint()
+    {
+        return true;
+    }
+    memory_contents_are_near_duplicates(&entry.content_lower, entry.memory_type, incoming)
+}
+
+fn memory_items_are_near_duplicates(existing: &MemoryItem, incoming: &MemoryItem) -> bool {
+    memory_contents_are_near_duplicates(&existing.content, existing.memory_type, incoming)
+}
+
+fn memory_contents_are_near_duplicates(
+    existing_content: &str,
+    existing_type: MemoryType,
+    incoming: &MemoryItem,
+) -> bool {
+    if existing_type != incoming.memory_type {
+        return false;
+    }
+    if has_conflicting_dedupe_polarity(existing_content, &incoming.content) {
+        return false;
+    }
+
+    let existing_terms = dedupe_terms(existing_content);
+    let incoming_terms = dedupe_terms(&incoming.content);
+    if existing_terms.len() < MIN_NEAR_DEDUPE_TERMS || incoming_terms.len() < MIN_NEAR_DEDUPE_TERMS
+    {
+        return false;
+    }
+
+    let overlap = existing_terms.intersection(&incoming_terms).count();
+    let union = existing_terms.len() + incoming_terms.len() - overlap;
+    union > 0 && overlap as f32 / union as f32 >= NEAR_DEDUPE_JACCARD_THRESHOLD
+}
+
+fn dedupe_terms(content: &str) -> HashSet<String> {
+    content
+        .to_ascii_lowercase()
+        .split(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/')))
+        .map(str::trim)
+        .filter(|term| term.chars().count() >= 3)
+        .filter(|term| !is_dedupe_stopword(term))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn has_conflicting_dedupe_polarity(left: &str, right: &str) -> bool {
+    has_negation_term(left) != has_negation_term(right)
+}
+
+fn has_negation_term(content: &str) -> bool {
+    content
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|term| {
+            matches!(
+                term,
+                "not" | "never" | "no" | "avoid" | "without" | "disable"
+            )
+        })
+}
+
+fn is_dedupe_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "after"
+            | "before"
+            | "from"
+            | "that"
+            | "this"
+            | "when"
+            | "then"
+            | "than"
+            | "into"
+            | "must"
+            | "should"
+            | "would"
+            | "could"
+            | "about"
+    )
+}
+
+fn merge_duplicate_memory_item(existing: MemoryItem, incoming: MemoryItem) -> MemoryItem {
+    let incoming = normalize_item_for_store(incoming);
+    let mut merged = existing.clone();
+
+    if should_replace_duplicate_content(&existing, &incoming) {
+        merged.content = incoming.content.clone();
+        merged.content_lower = incoming.content_lower.clone();
+    }
+    merged.importance = existing.importance.max(incoming.importance);
+    merged.timestamp = existing.timestamp.max(incoming.timestamp);
+    merged.memory_type = stronger_memory_type(existing.memory_type, incoming.memory_type);
+    merged.access_count = existing.access_count.max(incoming.access_count);
+    merged.last_accessed = max_optional_datetime(existing.last_accessed, incoming.last_accessed);
+
+    merge_tags(&mut merged.tags, &incoming.tags);
+    merge_metadata(&mut merged.metadata, &incoming.metadata);
+    record_duplicate_metadata(&mut merged.metadata, &incoming.id);
+
+    normalize_item_for_store(merged)
+}
+
+fn should_replace_duplicate_content(existing: &MemoryItem, incoming: &MemoryItem) -> bool {
+    incoming.importance > existing.importance
+        || (incoming.importance == existing.importance
+            && incoming.content.chars().count() > existing.content.chars().count())
+}
+
+fn stronger_memory_type(existing: MemoryType, incoming: MemoryType) -> MemoryType {
+    if memory_type_strength(incoming) > memory_type_strength(existing) {
+        incoming
+    } else {
+        existing
+    }
+}
+
+fn memory_type_strength(memory_type: MemoryType) -> u8 {
+    match memory_type {
+        MemoryType::Procedural | MemoryType::Semantic => 3,
+        MemoryType::Working => 2,
+        MemoryType::Episodic => 1,
+    }
+}
+
+fn max_optional_datetime(
+    left: Option<DateTime<Utc>>,
+    right: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn merge_tags(existing: &mut Vec<String>, incoming: &[String]) {
+    for tag in incoming {
+        if !existing.contains(tag) {
+            existing.push(tag.clone());
+        }
+    }
+}
+
+fn merge_metadata(existing: &mut HashMap<String, String>, incoming: &HashMap<String, String>) {
+    for (key, value) in incoming {
+        if value.trim().is_empty() {
+            continue;
+        }
+        match existing.get_mut(key) {
+            Some(current) if current == value => {}
+            Some(current) if is_list_metadata_key(key) => {
+                *current = merge_metadata_list(current, value);
+            }
+            Some(_) => {}
+            None => {
+                existing.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn is_list_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "supersedes" | "conflicts_with" | "tools" | "aliases" | "entity_aliases"
+    )
+}
+
+fn merge_metadata_list(existing: &str, incoming: &str) -> String {
+    let mut values = Vec::new();
+    for raw in existing.split(',').chain(incoming.split(',')) {
+        let value = raw.trim();
+        if !value.is_empty() && !values.iter().any(|seen| seen == value) {
+            values.push(value.to_string());
+        }
+    }
+    values.join(",")
+}
+
+fn record_duplicate_metadata(metadata: &mut HashMap<String, String>, incoming_id: &str) {
+    let count = metadata
+        .get("duplicate_count")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
+    metadata.insert("duplicate_count".to_string(), count.to_string());
+    metadata.insert("last_duplicate_at".to_string(), Utc::now().to_rfc3339());
+    if !incoming_id.trim().is_empty() {
+        let duplicate_ids = metadata
+            .get("duplicate_ids")
+            .map(|existing| merge_metadata_list(existing, incoming_id))
+            .unwrap_or_else(|| incoming_id.to_string());
+        metadata.insert("duplicate_ids".to_string(), duplicate_ids);
+    }
+}
+
+fn memory_is_prune_protected(item: &MemoryItem) -> bool {
+    item.access_count >= PRUNE_PROTECTED_ACCESS_COUNT
+        || item.tags.iter().any(|tag| {
+            matches!(
+                tag.as_str(),
+                "keep" | "pinned" | "protected" | "consolidated" | "conflict"
+            )
+        })
+        || metadata_truthy(&item.metadata, "keep")
+        || metadata_truthy(&item.metadata, "pinned")
+        || metadata_truthy(&item.metadata, "protected")
+        || metadata_nonempty(&item.metadata, "supersedes")
+        || metadata_nonempty(&item.metadata, "conflicts_with")
+}
+
+fn metadata_truthy(metadata: &HashMap<String, String>, key: &str) -> bool {
+    metadata
+        .get(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "keep" | "pinned" | "protected"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn metadata_nonempty(metadata: &HashMap<String, String>, key: &str) -> bool {
+    metadata
+        .get(key)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 /// Type of memory
@@ -200,6 +502,15 @@ pub enum MemoryType {
 #[async_trait::async_trait]
 pub trait MemoryStore: Send + Sync {
     async fn store(&self, item: MemoryItem) -> anyhow::Result<()>;
+    /// Store a memory and return the canonical item that now represents it.
+    ///
+    /// Default stores may merge durable duplicate content into an existing item
+    /// and return that existing item with updated metadata. Custom backends that
+    /// do not implement deduplication can rely on this default wrapper.
+    async fn store_and_return(&self, item: MemoryItem) -> anyhow::Result<MemoryItem> {
+        self.store(item.clone()).await?;
+        Ok(item)
+    }
     async fn retrieve(&self, id: &str) -> anyhow::Result<Option<MemoryItem>>;
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryItem>>;
     async fn search_by_tags(
@@ -244,6 +555,94 @@ fn sort_by_relevance(items: &mut [MemoryItem]) {
     });
 }
 
+fn memory_type_to_query_key(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Procedural => "procedural",
+        MemoryType::Working => "working",
+    }
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = query
+        .to_lowercase()
+        .split(|ch: char| {
+            !(ch.is_alphanumeric() || matches!(ch, '/' | '\\' | '_' | '-' | '.' | ':' | '@'))
+        })
+        .map(str::trim)
+        .filter(|term| term.chars().count() >= 2)
+        .map(ToOwned::to_owned)
+        .collect();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn lexical_match_score(
+    content_lower: &str,
+    tags: &[String],
+    memory_type: MemoryType,
+    query_lower: &str,
+    terms: &[String],
+) -> Option<f32> {
+    if query_lower.trim().is_empty() {
+        return Some(0.0);
+    }
+
+    let mut score = 0.0;
+    let mut matched_terms = 0usize;
+    if !query_lower.is_empty() && content_lower.contains(query_lower) {
+        score += 1.25;
+    }
+
+    let memory_type = memory_type_to_query_key(memory_type);
+    for term in terms {
+        let mut matched = false;
+        if content_lower.contains(term) {
+            score += 0.35;
+            matched = true;
+        }
+        if tags.iter().any(|tag| tag.to_lowercase().contains(term)) {
+            score += 0.55;
+            matched = true;
+        }
+        if memory_type.contains(term) {
+            score += 0.20;
+            matched = true;
+        }
+        if matched {
+            matched_terms += 1;
+        }
+    }
+
+    if score <= 0.0 {
+        return None;
+    }
+
+    if !terms.is_empty() {
+        score += matched_terms as f32 / terms.len() as f32;
+    }
+    Some(score)
+}
+
+fn index_search_score(
+    entry: &IndexEntry,
+    now: DateTime<Utc>,
+    config: &RelevanceConfig,
+    query_lower: &str,
+    terms: &[String],
+) -> Option<f32> {
+    let lexical = lexical_match_score(
+        &entry.content_lower,
+        &entry.tags,
+        entry.memory_type,
+        query_lower,
+        terms,
+    )?;
+    Some(index_score(entry, now, config) + lexical)
+}
+
 // ============================================================================
 // In-Memory Store
 // ============================================================================
@@ -272,35 +671,70 @@ impl InMemoryStore {
 #[async_trait::async_trait]
 impl MemoryStore for InMemoryStore {
     async fn store(&self, item: MemoryItem) -> anyhow::Result<()> {
+        self.store_and_return(item).await.map(|_| ())
+    }
+
+    async fn store_and_return(&self, item: MemoryItem) -> anyhow::Result<MemoryItem> {
+        let item = normalize_item_for_store(item);
         let mut items = self.items.write().await;
         if let Some(pos) = items.iter().position(|i| i.id == item.id) {
-            items[pos] = item;
-        } else {
-            items.push(item);
+            items[pos] = item.clone();
+            return Ok(item);
         }
-        Ok(())
+
+        if let Some(pos) = items
+            .iter()
+            .position(|existing| memories_are_store_duplicates(existing, &item))
+        {
+            let merged = merge_duplicate_memory_item(items[pos].clone(), item);
+            items[pos] = merged.clone();
+            return Ok(merged);
+        }
+
+        items.push(item.clone());
+        Ok(item)
     }
 
     async fn retrieve(&self, id: &str) -> anyhow::Result<Option<MemoryItem>> {
-        Ok(self.items.read().await.iter().find(|i| i.id == id).cloned())
+        let mut items = self.items.write().await;
+        let Some(item) = items.iter_mut().find(|i| i.id == id) else {
+            return Ok(None);
+        };
+        item.record_access();
+        Ok(Some(item.clone()))
     }
 
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
         let query_lower = query.to_lowercase();
         let config = RelevanceConfig::default();
         let now = Utc::now();
-        let items = self.items.read().await;
-        let mut matches: Vec<MemoryItem> = items
+        let terms = query_terms(&query_lower);
+        let mut items = self.items.write().await;
+        let mut scored: Vec<(usize, f32)> = items
             .iter()
-            .filter(|i| i.content_lower.contains(&query_lower))
-            .cloned()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                let lexical = lexical_match_score(
+                    &item.content_lower,
+                    &item.tags,
+                    item.memory_type,
+                    &query_lower,
+                    &terms,
+                )?;
+                Some((idx, item.relevance_score_at(now, &config) + lexical))
+            })
             .collect();
-        matches.sort_by(|a, b| {
-            b.relevance_score_at(now, &config)
-                .partial_cmp(&a.relevance_score_at(now, &config))
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| items[a.0].timestamp.cmp(&items[b.0].timestamp))
         });
-        matches.truncate(limit);
+        let ids: Vec<usize> = scored.into_iter().take(limit).map(|(idx, _)| idx).collect();
+        let mut matches = Vec::with_capacity(ids.len());
+        for idx in ids {
+            items[idx].record_access();
+            matches.push(items[idx].clone());
+        }
         Ok(matches)
     }
 
@@ -311,25 +745,31 @@ impl MemoryStore for InMemoryStore {
     ) -> anyhow::Result<Vec<MemoryItem>> {
         let config = RelevanceConfig::default();
         let now = Utc::now();
-        let items = self.items.read().await;
-        let mut matches: Vec<MemoryItem> = items
+        let mut items = self.items.write().await;
+        let mut scored: Vec<(usize, f32)> = items
             .iter()
-            .filter(|i| tags.iter().any(|t| i.tags.contains(t)))
-            .cloned()
+            .enumerate()
+            .filter(|(_, item)| tags.iter().any(|t| item.tags.contains(t)))
+            .map(|(idx, item)| (idx, item.relevance_score_at(now, &config)))
             .collect();
-        matches.sort_by(|a, b| {
-            b.relevance_score_at(now, &config)
-                .partial_cmp(&a.relevance_score_at(now, &config))
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| items[a.0].timestamp.cmp(&items[b.0].timestamp))
         });
-        matches.truncate(limit);
+        let ids: Vec<usize> = scored.into_iter().take(limit).map(|(idx, _)| idx).collect();
+        let mut matches = Vec::with_capacity(ids.len());
+        for idx in ids {
+            items[idx].record_access();
+            matches.push(items[idx].clone());
+        }
         Ok(matches)
     }
 
     async fn get_recent(&self, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
         let items = self.items.read().await;
         let mut sorted: Vec<MemoryItem> = items.iter().cloned().collect();
-        sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        sorted.sort_by_key(|item| std::cmp::Reverse(item.timestamp));
         sorted.truncate(limit);
         Ok(sorted)
     }
@@ -372,18 +812,43 @@ impl MemoryStore for InMemoryStore {
         let mut items = self.items.write().await;
         let before = items.len();
 
-        // Phase 1: remove items that are both old and below the importance threshold.
-        items.retain(|item| item.importance >= min_importance || item.timestamp >= cutoff);
+        // Phase 1: remove items that are old and below the importance threshold,
+        // unless they have explicit curation/provenance protection.
+        items.retain(|item| {
+            memory_is_prune_protected(item)
+                || item.importance >= min_importance
+                || item.timestamp >= cutoff
+        });
 
-        // Phase 2: if still over the cap, keep the highest-relevance items.
+        // Phase 2: if still over the cap, keep protected memories first and then
+        // the highest-relevance unprotected items.
         if policy.max_items > 0 && items.len() > policy.max_items {
             let config = RelevanceConfig::default();
+            let protected_count = items
+                .iter()
+                .filter(|item| memory_is_prune_protected(item))
+                .count();
+            let unprotected_to_keep = policy.max_items.saturating_sub(protected_count);
+            let mut unprotected_seen = 0usize;
             items.sort_by(|a, b| {
-                b.relevance_score_at(now, &config)
-                    .partial_cmp(&a.relevance_score_at(now, &config))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                memory_is_prune_protected(b)
+                    .cmp(&memory_is_prune_protected(a))
+                    .then_with(|| {
+                        b.relevance_score_at(now, &config)
+                            .partial_cmp(&a.relevance_score_at(now, &config))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
             });
-            items.truncate(policy.max_items);
+            items.retain(|item| {
+                if memory_is_prune_protected(item) {
+                    true
+                } else if unprotected_seen < unprotected_to_keep {
+                    unprotected_seen += 1;
+                    true
+                } else {
+                    false
+                }
+            });
         }
 
         Ok(before - items.len())
@@ -430,6 +895,12 @@ pub struct FileMemoryStore {
     index: RwLock<Vec<IndexEntry>>,
 }
 
+static FILE_MEMORY_INDEX_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn file_memory_index_lock() -> &'static tokio::sync::Mutex<()> {
+    FILE_MEMORY_INDEX_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 impl FileMemoryStore {
     pub async fn new(dir: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
@@ -468,11 +939,33 @@ impl FileMemoryStore {
         self.items_dir.join(format!("{}.json", Self::safe_id(id)))
     }
 
-    async fn save_index(&self) -> anyhow::Result<()> {
-        let index = self.index.read().await;
-        let json = serde_json::to_string(&*index).context("Failed to serialize memory index")?;
-        drop(index);
-        let tmp = self.index_path.with_extension("json.tmp");
+    async fn read_index_from_disk(&self) -> anyhow::Result<Vec<IndexEntry>> {
+        if !self.index_path.exists() {
+            return Ok(Vec::new());
+        }
+        let data = tokio::fs::read_to_string(&self.index_path)
+            .await
+            .with_context(|| {
+                format!("Failed to read memory index: {}", self.index_path.display())
+            })?;
+        Ok(serde_json::from_str(&data).unwrap_or_default())
+    }
+
+    async fn current_index(&self) -> Vec<IndexEntry> {
+        match self.read_index_from_disk().await {
+            Ok(index) => {
+                *self.index.write().await = index.clone();
+                index
+            }
+            Err(_) => self.index.read().await.clone(),
+        }
+    }
+
+    async fn write_index_entries(&self, index: &[IndexEntry]) -> anyhow::Result<()> {
+        let json = serde_json::to_string(index).context("Failed to serialize memory index")?;
+        let tmp = self
+            .index_path
+            .with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
         tokio::fs::write(&tmp, json.as_bytes())
             .await
             .context("Failed to write memory index temp file")?;
@@ -480,6 +973,11 @@ impl FileMemoryStore {
             .await
             .context("Failed to rename memory index")?;
         Ok(())
+    }
+
+    async fn save_index(&self) -> anyhow::Result<()> {
+        let index = self.index.read().await.clone();
+        self.write_index_entries(&index).await
     }
 
     async fn save_item(&self, item: &MemoryItem) -> anyhow::Result<()> {
@@ -496,8 +994,19 @@ impl FileMemoryStore {
         Ok(())
     }
 
+    async fn load_item_without_access(&self, id: &str) -> anyhow::Result<Option<MemoryItem>> {
+        let path = self.item_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = tokio::fs::read_to_string(&path).await?;
+        let item: MemoryItem = serde_json::from_str(&data)?;
+        Ok(Some(normalize_item_for_store(item)))
+    }
+
     /// Rebuild the index from item files on disk (useful for corruption recovery).
     pub async fn rebuild_index(&self) -> anyhow::Result<usize> {
+        let _guard = file_memory_index_lock().lock().await;
         let mut entries = tokio::fs::read_dir(&self.items_dir).await?;
         let mut new_index = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
@@ -511,8 +1020,8 @@ impl FileMemoryStore {
             }
         }
         let count = new_index.len();
+        self.write_index_entries(&new_index).await?;
         *self.index.write().await = new_index;
-        self.save_index().await?;
         Ok(count)
     }
 }
@@ -520,18 +1029,51 @@ impl FileMemoryStore {
 #[async_trait::async_trait]
 impl MemoryStore for FileMemoryStore {
     async fn store(&self, item: MemoryItem) -> anyhow::Result<()> {
-        let mut item = item;
+        self.store_and_return(item).await.map(|_| ())
+    }
+
+    async fn store_and_return(&self, item: MemoryItem) -> anyhow::Result<MemoryItem> {
+        let _guard = file_memory_index_lock().lock().await;
+        let mut item = normalize_item_for_store(item);
         item.id = Self::safe_id(&item.id);
+        let mut index = self.read_index_from_disk().await.unwrap_or_default();
+
+        let duplicate_id = index
+            .iter()
+            .find(|entry| memory_index_entry_is_duplicate(entry, &item))
+            .map(|entry| entry.id.clone());
+        if let Some(duplicate_id) = duplicate_id {
+            if duplicate_id != item.id {
+                if let Some(existing) = self.load_item_without_access(&duplicate_id).await? {
+                    if memories_are_store_duplicates(&existing, &item) {
+                        let merged = merge_duplicate_memory_item(existing, item.clone());
+                        self.save_item(&merged).await?;
+                        if item.id != merged.id {
+                            let stale_path = self.item_path(&item.id);
+                            if stale_path.exists() {
+                                let _ = tokio::fs::remove_file(stale_path).await;
+                            }
+                        }
+                        index.retain(|entry| entry.id != item.id && entry.id != merged.id);
+                        index.push(IndexEntry::from(&merged));
+                        self.write_index_entries(&index).await?;
+                        *self.index.write().await = index;
+                        return Ok(merged);
+                    }
+                }
+            }
+        }
+
         self.save_item(&item).await?;
         let entry = IndexEntry::from(&item);
-        let mut index = self.index.write().await;
         if let Some(pos) = index.iter().position(|e| e.id == item.id) {
             index[pos] = entry;
         } else {
             index.push(entry);
         }
-        drop(index);
-        self.save_index().await
+        self.write_index_entries(&index).await?;
+        *self.index.write().await = index;
+        Ok(item)
     }
 
     async fn retrieve(&self, id: &str) -> anyhow::Result<Option<MemoryItem>> {
@@ -542,33 +1084,42 @@ impl MemoryStore for FileMemoryStore {
         let data = tokio::fs::read_to_string(&path).await?;
         let mut item: MemoryItem = serde_json::from_str(&data)?;
         item.content_lower = item.content.to_lowercase();
+        item.record_access();
+        self.save_item(&item).await?;
         Ok(Some(item))
     }
 
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
         let query_lower = query.to_lowercase();
-        let index = self.index.read().await;
+        let index = self.current_index().await;
         let now = Utc::now();
         let config = RelevanceConfig::default();
-        let mut matches: Vec<&IndexEntry> = index
+        let terms = query_terms(&query_lower);
+        let mut matches: Vec<(&IndexEntry, f32)> = index
             .iter()
-            .filter(|e| e.content_lower.contains(&query_lower))
+            .filter_map(|e| {
+                Some((
+                    e,
+                    index_search_score(e, now, &config, &query_lower, &terms)?,
+                ))
+            })
             .collect();
         matches.sort_by(|a, b| {
-            index_score(a, now, &config)
-                .partial_cmp(&index_score(b, now, &config))
+            b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .reverse()
+                .then_with(|| b.0.timestamp.cmp(&a.0.timestamp))
         });
-        let ids: Vec<String> = matches.iter().take(limit).map(|e| e.id.clone()).collect();
-        drop(index);
+        let ids: Vec<String> = matches
+            .iter()
+            .take(limit)
+            .map(|(e, _)| e.id.clone())
+            .collect();
         let mut items = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(item) = self.retrieve(&id).await? {
                 items.push(item);
             }
         }
-        sort_by_relevance(&mut items);
         Ok(items)
     }
 
@@ -577,7 +1128,7 @@ impl MemoryStore for FileMemoryStore {
         tags: &[String],
         limit: usize,
     ) -> anyhow::Result<Vec<MemoryItem>> {
-        let index = self.index.read().await;
+        let index = self.current_index().await;
         let now = Utc::now();
         let config = RelevanceConfig::default();
         let mut matches: Vec<&IndexEntry> = index
@@ -591,7 +1142,6 @@ impl MemoryStore for FileMemoryStore {
                 .reverse()
         });
         let ids: Vec<String> = matches.iter().take(limit).map(|e| e.id.clone()).collect();
-        drop(index);
         let mut items = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(item) = self.retrieve(&id).await? {
@@ -603,23 +1153,22 @@ impl MemoryStore for FileMemoryStore {
     }
 
     async fn get_recent(&self, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
-        let index = self.index.read().await;
+        let index = self.current_index().await;
         let mut sorted: Vec<&IndexEntry> = index.iter().collect();
-        sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
         let ids: Vec<String> = sorted.iter().take(limit).map(|e| e.id.clone()).collect();
-        drop(index);
         let mut items = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(item) = self.retrieve(&id).await? {
                 items.push(item);
             }
         }
-        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        items.sort_by_key(|item| std::cmp::Reverse(item.timestamp));
         Ok(items)
     }
 
     async fn get_important(&self, threshold: f32, limit: usize) -> anyhow::Result<Vec<MemoryItem>> {
-        let index = self.index.read().await;
+        let index = self.current_index().await;
         let mut matches: Vec<&IndexEntry> =
             index.iter().filter(|e| e.importance >= threshold).collect();
         matches.sort_by(|a, b| {
@@ -628,7 +1177,6 @@ impl MemoryStore for FileMemoryStore {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         let ids: Vec<String> = matches.iter().take(limit).map(|e| e.id.clone()).collect();
-        drop(index);
         let mut items = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(item) = self.retrieve(&id).await? {
@@ -644,17 +1192,20 @@ impl MemoryStore for FileMemoryStore {
     }
 
     async fn delete(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = file_memory_index_lock().lock().await;
         let path = self.item_path(id);
         if path.exists() {
             tokio::fs::remove_file(&path).await?;
         }
-        let mut index = self.index.write().await;
+        let mut index = self.read_index_from_disk().await.unwrap_or_default();
         index.retain(|e| e.id != id);
-        drop(index);
-        self.save_index().await
+        self.write_index_entries(&index).await?;
+        *self.index.write().await = index;
+        Ok(())
     }
 
     async fn clear(&self) -> anyhow::Result<()> {
+        let _guard = file_memory_index_lock().lock().await;
         let mut entries = tokio::fs::read_dir(&self.items_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -667,7 +1218,7 @@ impl MemoryStore for FileMemoryStore {
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
-        Ok(self.index.read().await.len())
+        Ok(self.current_index().await.len())
     }
 
     async fn prune(&self, policy: &PrunePolicy) -> anyhow::Result<usize> {
@@ -675,37 +1226,61 @@ impl MemoryStore for FileMemoryStore {
         let cutoff = now - chrono::Duration::days(policy.max_age_days as i64);
         let min_importance = policy.min_importance_to_keep;
 
-        // Phase 1: collect IDs that are old AND below the importance threshold.
-        let phase1_ids: Vec<String> = {
-            let index = self.index.read().await;
-            index
-                .iter()
-                .filter(|e| e.importance < min_importance && e.timestamp < cutoff)
-                .map(|e| e.id.clone())
-                .collect()
-        };
+        // Phase 1: collect IDs that are old and low-importance, unless the full
+        // item carries curation/provenance protection.
+        let mut items = Vec::new();
+        for entry in self.current_index().await {
+            if let Some(item) = self.load_item_without_access(&entry.id).await? {
+                items.push(item);
+            }
+        }
+        let phase1_ids: Vec<String> = items
+            .iter()
+            .filter(|item| {
+                !memory_is_prune_protected(item)
+                    && item.importance < min_importance
+                    && item.timestamp < cutoff
+            })
+            .map(|item| item.id.clone())
+            .collect();
         let mut deleted = phase1_ids.len();
         for id in &phase1_ids {
             self.delete(id).await?;
         }
 
-        // Phase 2: enforce max_items cap by removing lowest-relevance items.
+        // Phase 2: enforce max_items cap by removing lowest-relevance
+        // unprotected items. Protected items are hard-exempt, so the store may
+        // remain above the cap if the user pinned more memories than the cap.
         if policy.max_items > 0 {
             let config = RelevanceConfig::default();
             let phase2_ids: Vec<String> = {
-                let index = self.index.read().await;
-                if index.len() <= policy.max_items {
+                let mut remaining = Vec::new();
+                for entry in self.current_index().await {
+                    if let Some(item) = self.load_item_without_access(&entry.id).await? {
+                        remaining.push(item);
+                    }
+                }
+                if remaining.len() <= policy.max_items {
                     Vec::new()
                 } else {
-                    let mut entries: Vec<&IndexEntry> = index.iter().collect();
-                    entries.sort_by(|a, b| {
-                        index_score(b, now, &config)
-                            .partial_cmp(&index_score(a, now, &config))
+                    let protected_count = remaining
+                        .iter()
+                        .filter(|item| memory_is_prune_protected(item))
+                        .count();
+                    let unprotected_to_keep = policy.max_items.saturating_sub(protected_count);
+                    let mut unprotected: Vec<MemoryItem> = remaining
+                        .into_iter()
+                        .filter(|item| !memory_is_prune_protected(item))
+                        .collect();
+                    unprotected.sort_by(|a, b| {
+                        b.relevance_score_at(now, &config)
+                            .partial_cmp(&a.relevance_score_at(now, &config))
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                    entries[policy.max_items..]
-                        .iter()
-                        .map(|e| e.id.clone())
+                    unprotected
+                        .into_iter()
+                        .skip(unprotected_to_keep)
+                        .map(|item| item.id)
                         .collect()
                 }
             };
@@ -754,6 +1329,36 @@ mod tests {
         item.record_access();
         assert_eq!(item.access_count, 1);
         assert!(item.last_accessed.is_some());
+    }
+
+    #[test]
+    fn test_memory_item_merge_duplicate_preserves_canonical_id() {
+        let existing = MemoryItem::new("Run focused memory store tests after parser changes.")
+            .with_importance(0.4)
+            .with_tag("memory")
+            .with_metadata("source", "workflow");
+        let existing_id = existing.id.clone();
+        let incoming =
+            MemoryItem::new("Run focused memory store regression tests after parser changes.")
+                .with_importance(0.9)
+                .with_tag("tests")
+                .with_metadata("supersedes", "old-memory");
+
+        let merged = existing.merge_duplicate(incoming);
+
+        assert_eq!(merged.id, existing_id);
+        assert!(merged.content.contains("regression tests"));
+        assert_eq!(merged.importance, 0.9);
+        assert!(merged.tags.contains(&"memory".to_string()));
+        assert!(merged.tags.contains(&"tests".to_string()));
+        assert_eq!(
+            merged.metadata.get("duplicate_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            merged.metadata.get("supersedes").map(String::as_str),
+            Some("old-memory")
+        );
     }
 
     #[test]
@@ -853,6 +1458,8 @@ mod tests {
         let r = store.retrieve(&item.id).await.unwrap();
         assert!(r.is_some());
         assert_eq!(r.unwrap().content, "hello");
+        let r = store.retrieve(&item.id).await.unwrap().unwrap();
+        assert_eq!(r.access_count, 2);
     }
 
     #[tokio::test]
@@ -1106,6 +1713,36 @@ mod file_memory_store_tests {
     }
 
     #[tokio::test]
+    async fn test_search_matches_non_contiguous_terms() {
+        let (_dir, store) = setup().await;
+        store
+            .store(MemoryItem::new(
+                "Success: release preflight\nTools: bash\nResult: provider verification passed",
+            ))
+            .await
+            .unwrap();
+        let results = store.search("release provider check", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("release preflight"));
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_records_access_on_disk() {
+        let (dir, store) = setup().await;
+        let item = MemoryItem::new("access me");
+        let id = item.id.clone();
+        store.store(item).await.unwrap();
+
+        let item = store.retrieve(&id).await.unwrap().unwrap();
+        assert_eq!(item.access_count, 1);
+
+        let reopened = FileMemoryStore::new(dir.path()).await.unwrap();
+        let item = reopened.retrieve(&id).await.unwrap().unwrap();
+        assert_eq!(item.access_count, 2);
+        assert!(item.last_accessed.is_some());
+    }
+
+    #[tokio::test]
     async fn test_search_limit() {
         let (_dir, store) = setup().await;
         for i in 0..10 {
@@ -1220,6 +1857,26 @@ mod file_memory_store_tests {
             assert_eq!(store.count().await.unwrap(), 1);
             assert_eq!(store.search("persistent", 10).await.unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn test_stale_instances_merge_index_on_store() {
+        let dir = TempDir::new().unwrap();
+        let store_a = FileMemoryStore::new(dir.path()).await.unwrap();
+        let store_b = FileMemoryStore::new(dir.path()).await.unwrap();
+
+        store_a
+            .store(MemoryItem::new("alpha stale merge"))
+            .await
+            .unwrap();
+        store_b
+            .store(MemoryItem::new("beta stale merge"))
+            .await
+            .unwrap();
+
+        let reopened = FileMemoryStore::new(dir.path()).await.unwrap();
+        assert_eq!(reopened.count().await.unwrap(), 2);
+        assert_eq!(reopened.search("stale merge", 10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

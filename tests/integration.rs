@@ -191,6 +191,186 @@ async fn contract_relevance_ordering(store: &dyn MemoryStore) {
     assert!(results[0].importance >= results[1].importance);
 }
 
+async fn contract_search_specificity_beats_generic_importance(store: &dyn MemoryStore) {
+    store
+        .store(
+            MemoryItem::new("memory")
+                .with_importance(1.0)
+                .with_type(MemoryType::Semantic),
+        )
+        .await
+        .unwrap();
+    store
+        .store(
+            MemoryItem::new(
+                "Run focused memory extraction tests after changing the agent memory pipeline.",
+            )
+            .with_importance(0.2)
+            .with_type(MemoryType::Procedural),
+        )
+        .await
+        .unwrap();
+
+    let results = store
+        .search("focused memory extraction tests", 10)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].content.contains("memory extraction tests"));
+}
+
+async fn contract_store_deduplicates_durable_content(store: &dyn MemoryStore) {
+    store
+        .store(
+            MemoryItem::new("Run focused memory extraction tests after parser changes.")
+                .with_importance(0.35)
+                .with_tag("memory")
+                .with_metadata("source", "workflow"),
+        )
+        .await
+        .unwrap();
+    store
+        .store(
+            MemoryItem::new("  run focused MEMORY extraction tests after parser changes! ")
+                .with_importance(0.9)
+                .with_tag("tests")
+                .with_metadata("supersedes", "old-memory"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(store.count().await.unwrap(), 1);
+    let results = store
+        .search("focused memory extraction parser changes", 10)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    let item = &results[0];
+    assert_eq!(item.importance, 0.9);
+    assert!(item.tags.contains(&"memory".to_string()));
+    assert!(item.tags.contains(&"tests".to_string()));
+    assert_eq!(
+        item.metadata.get("supersedes").map(String::as_str),
+        Some("old-memory")
+    );
+    assert_eq!(
+        item.metadata.get("duplicate_count").map(String::as_str),
+        Some("1")
+    );
+}
+
+async fn contract_store_merges_near_duplicate_content(store: &dyn MemoryStore) {
+    store
+        .store(
+            MemoryItem::new("Run focused memory store tests after parser changes.")
+                .with_importance(0.35)
+                .with_tag("memory")
+                .with_type(MemoryType::Procedural),
+        )
+        .await
+        .unwrap();
+    store
+        .store(
+            MemoryItem::new("Run focused memory store regression tests after parser changes.")
+                .with_importance(0.9)
+                .with_tag("tests")
+                .with_type(MemoryType::Procedural),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(store.count().await.unwrap(), 1);
+    let results = store
+        .search("focused memory store regression tests parser", 10)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    let item = &results[0];
+    assert!(item.content.contains("regression tests"));
+    assert_eq!(item.importance, 0.9);
+    assert!(item.tags.contains(&"memory".to_string()));
+    assert!(item.tags.contains(&"tests".to_string()));
+    assert_eq!(
+        item.metadata.get("duplicate_count").map(String::as_str),
+        Some("1")
+    );
+}
+
+async fn contract_store_keeps_conflicting_near_duplicate_content(store: &dyn MemoryStore) {
+    store
+        .store(
+            MemoryItem::new("Use file memory store for local sessions.")
+                .with_type(MemoryType::Semantic),
+        )
+        .await
+        .unwrap();
+    store
+        .store(
+            MemoryItem::new("Do not use file memory store for local sessions.")
+                .with_type(MemoryType::Semantic),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(store.count().await.unwrap(), 2);
+    let results = store
+        .search("file memory store local sessions", 10)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|item| item.content.starts_with("Use ")));
+    assert!(results
+        .iter()
+        .any(|item| item.content.starts_with("Do not use")));
+}
+
+async fn contract_prune_protects_curated_memories(store: &dyn MemoryStore) {
+    let mut pinned = MemoryItem::new("Pinned low-importance memory.")
+        .with_importance(0.1)
+        .with_tag("pinned");
+    pinned.timestamp = chrono::Utc::now() - chrono::Duration::days(120);
+    store.store(pinned).await.unwrap();
+
+    let mut accessed =
+        MemoryItem::new("Frequently recalled low-importance memory.").with_importance(0.1);
+    accessed.timestamp = chrono::Utc::now() - chrono::Duration::days(120);
+    accessed.record_access();
+    accessed.record_access();
+    accessed.record_access();
+    store.store(accessed).await.unwrap();
+
+    let mut related = MemoryItem::new("Conflict memory should remain auditable.")
+        .with_importance(0.1)
+        .with_metadata("conflicts_with", "legacy-memory");
+    related.timestamp = chrono::Utc::now() - chrono::Duration::days(120);
+    store.store(related).await.unwrap();
+
+    let mut stale = MemoryItem::new("Unprotected stale memory.").with_importance(0.1);
+    stale.timestamp = chrono::Utc::now() - chrono::Duration::days(120);
+    store.store(stale).await.unwrap();
+
+    let policy = a3s_memory::PrunePolicy {
+        max_age_days: 90,
+        min_importance_to_keep: 0.5,
+        max_items: 2,
+    };
+    let deleted = store.prune(&policy).await.unwrap();
+
+    assert_eq!(deleted, 1);
+    let results = store.search("memory", 10).await.unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results
+        .iter()
+        .any(|item| item.tags.contains(&"pinned".into())));
+    assert!(results.iter().any(|item| item.access_count >= 3));
+    assert!(results
+        .iter()
+        .any(|item| item.metadata.contains_key("conflicts_with")));
+    assert!(!results
+        .iter()
+        .any(|item| item.content.contains("Unprotected stale")));
+}
+
 // ============================================================================
 // InMemoryStore contract tests
 // ============================================================================
@@ -223,6 +403,26 @@ in_memory_test!(in_memory_delete_nonexistent, contract_delete_nonexistent);
 in_memory_test!(in_memory_clear, contract_clear);
 in_memory_test!(in_memory_count, contract_count);
 in_memory_test!(in_memory_relevance_ordering, contract_relevance_ordering);
+in_memory_test!(
+    in_memory_search_specificity_beats_generic_importance,
+    contract_search_specificity_beats_generic_importance
+);
+in_memory_test!(
+    in_memory_store_deduplicates_durable_content,
+    contract_store_deduplicates_durable_content
+);
+in_memory_test!(
+    in_memory_store_merges_near_duplicate_content,
+    contract_store_merges_near_duplicate_content
+);
+in_memory_test!(
+    in_memory_store_keeps_conflicting_near_duplicate_content,
+    contract_store_keeps_conflicting_near_duplicate_content
+);
+in_memory_test!(
+    in_memory_prune_protects_curated_memories,
+    contract_prune_protects_curated_memories
+);
 
 // ============================================================================
 // FileMemoryStore contract tests
@@ -255,6 +455,26 @@ file_store_test!(file_delete_nonexistent, contract_delete_nonexistent);
 file_store_test!(file_clear, contract_clear);
 file_store_test!(file_count, contract_count);
 file_store_test!(file_relevance_ordering, contract_relevance_ordering);
+file_store_test!(
+    file_search_specificity_beats_generic_importance,
+    contract_search_specificity_beats_generic_importance
+);
+file_store_test!(
+    file_store_deduplicates_durable_content,
+    contract_store_deduplicates_durable_content
+);
+file_store_test!(
+    file_store_merges_near_duplicate_content,
+    contract_store_merges_near_duplicate_content
+);
+file_store_test!(
+    file_store_keeps_conflicting_near_duplicate_content,
+    contract_store_keeps_conflicting_near_duplicate_content
+);
+file_store_test!(
+    file_prune_protects_curated_memories,
+    contract_prune_protects_curated_memories
+);
 
 // ============================================================================
 // FileMemoryStore-specific tests
