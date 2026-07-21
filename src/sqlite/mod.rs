@@ -716,7 +716,7 @@ mod tests {
 
         let mut duplicate = make_item(
             "duplicate",
-            "run focused MEMORY extraction tests after parser changes!",
+            "  run focused MEMORY extraction tests after parser changes.  ",
             0.9,
         );
         duplicate.tags = vec!["tests".to_string()];
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_merges_near_duplicate_content() {
+    async fn test_store_keeps_distinct_related_content() {
         let dir = TempDir::new().unwrap();
         let s = store(&dir).await;
 
@@ -752,29 +752,26 @@ mod tests {
         first.tags = vec!["memory".to_string()];
         s.store(first).await.unwrap();
 
-        let mut duplicate = make_item(
-            "duplicate",
+        let mut related = make_item(
+            "related",
             "Run focused memory store regression tests after parser changes.",
             0.9,
         );
-        duplicate.memory_type = MemoryType::Procedural;
-        duplicate.tags = vec!["tests".to_string()];
-        let stored = s.store_and_return(duplicate).await.unwrap();
+        related.memory_type = MemoryType::Procedural;
+        related.tags = vec!["tests".to_string()];
+        let stored = s.store_and_return(related).await.unwrap();
 
-        assert_eq!(stored.id, "first");
-        assert_eq!(s.count().await.unwrap(), 1);
+        assert_eq!(stored.id, "related");
+        assert_eq!(s.count().await.unwrap(), 2);
         let recalled = s.retrieve("first").await.unwrap().unwrap();
-        assert!(recalled.content.contains("regression tests"));
         assert!(recalled.tags.contains(&"memory".to_string()));
-        assert!(recalled.tags.contains(&"tests".to_string()));
-        assert_eq!(
-            recalled.metadata.get("duplicate_count").map(String::as_str),
-            Some("1")
-        );
+        assert!(!recalled.tags.contains(&"tests".to_string()));
+        assert!(recalled.metadata.get("duplicate_count").is_none());
+        assert!(s.retrieve("related").await.unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn test_store_keeps_conflicting_near_duplicate_content() {
+    async fn test_store_keeps_opposite_instructions_distinct() {
         let dir = TempDir::new().unwrap();
         let s = store(&dir).await;
 
