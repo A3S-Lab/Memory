@@ -231,7 +231,7 @@ async fn contract_store_deduplicates_durable_content(store: &dyn MemoryStore) {
         .unwrap();
     store
         .store(
-            MemoryItem::new("  run focused MEMORY extraction tests after parser changes! ")
+            MemoryItem::new("  run focused MEMORY extraction tests after parser changes. ")
                 .with_importance(0.9)
                 .with_tag("tests")
                 .with_metadata("supersedes", "old-memory"),
@@ -259,7 +259,7 @@ async fn contract_store_deduplicates_durable_content(store: &dyn MemoryStore) {
     );
 }
 
-async fn contract_store_merges_near_duplicate_content(store: &dyn MemoryStore) {
+async fn contract_store_keeps_distinct_related_content(store: &dyn MemoryStore) {
     store
         .store(
             MemoryItem::new("Run focused memory store tests after parser changes.")
@@ -279,24 +279,26 @@ async fn contract_store_merges_near_duplicate_content(store: &dyn MemoryStore) {
         .await
         .unwrap();
 
-    assert_eq!(store.count().await.unwrap(), 1);
+    assert_eq!(store.count().await.unwrap(), 2);
     let results = store
         .search("focused memory store regression tests parser", 10)
         .await
         .unwrap();
-    assert_eq!(results.len(), 1);
-    let item = &results[0];
-    assert!(item.content.contains("regression tests"));
-    assert_eq!(item.importance, 0.9);
-    assert!(item.tags.contains(&"memory".to_string()));
-    assert!(item.tags.contains(&"tests".to_string()));
-    assert_eq!(
-        item.metadata.get("duplicate_count").map(String::as_str),
-        Some("1")
-    );
+    assert_eq!(results.len(), 2);
+    assert!(results
+        .iter()
+        .any(|item| item.content.contains("regression tests")
+            && item.tags.contains(&"tests".to_string())));
+    assert!(results
+        .iter()
+        .any(|item| !item.content.contains("regression tests")
+            && item.tags.contains(&"memory".to_string())));
+    assert!(results
+        .iter()
+        .all(|item| !item.metadata.contains_key("duplicate_count")));
 }
 
-async fn contract_store_keeps_conflicting_near_duplicate_content(store: &dyn MemoryStore) {
+async fn contract_store_keeps_opposite_instructions_distinct(store: &dyn MemoryStore) {
     store
         .store(
             MemoryItem::new("Use file memory store for local sessions.")
@@ -412,12 +414,12 @@ in_memory_test!(
     contract_store_deduplicates_durable_content
 );
 in_memory_test!(
-    in_memory_store_merges_near_duplicate_content,
-    contract_store_merges_near_duplicate_content
+    in_memory_store_keeps_distinct_related_content,
+    contract_store_keeps_distinct_related_content
 );
 in_memory_test!(
-    in_memory_store_keeps_conflicting_near_duplicate_content,
-    contract_store_keeps_conflicting_near_duplicate_content
+    in_memory_store_keeps_opposite_instructions_distinct,
+    contract_store_keeps_opposite_instructions_distinct
 );
 in_memory_test!(
     in_memory_prune_protects_curated_memories,
@@ -464,12 +466,12 @@ file_store_test!(
     contract_store_deduplicates_durable_content
 );
 file_store_test!(
-    file_store_merges_near_duplicate_content,
-    contract_store_merges_near_duplicate_content
+    file_store_keeps_distinct_related_content,
+    contract_store_keeps_distinct_related_content
 );
 file_store_test!(
-    file_store_keeps_conflicting_near_duplicate_content,
-    contract_store_keeps_conflicting_near_duplicate_content
+    file_store_keeps_opposite_instructions_distinct,
+    contract_store_keeps_opposite_instructions_distinct
 );
 file_store_test!(
     file_prune_protects_curated_memories,

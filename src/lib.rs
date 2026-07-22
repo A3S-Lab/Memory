@@ -22,13 +22,11 @@ pub use sqlite::SqliteMemoryStore;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
 const MIN_DEDUPE_FINGERPRINT_CHARS: usize = 24;
-const MIN_NEAR_DEDUPE_TERMS: usize = 5;
-const NEAR_DEDUPE_JACCARD_THRESHOLD: f32 = 0.86;
 const PRUNE_PROTECTED_ACCESS_COUNT: u32 = 3;
 
 // ============================================================================
@@ -171,8 +169,8 @@ impl MemoryItem {
         self
     }
 
-    /// Stable, punctuation-insensitive content fingerprint used by default
-    /// stores to collapse exact durable duplicates.
+    /// Stable, case- and whitespace-normalized content fingerprint used by
+    /// default stores to collapse exact durable duplicates.
     ///
     /// Very short memories return `None` so generic fragments such as "ok" or
     /// "done" are not accidentally merged.
@@ -212,20 +210,11 @@ fn normalize_item_for_store(mut item: MemoryItem) -> MemoryItem {
 }
 
 fn memory_content_fingerprint(content: &str) -> Option<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in content.chars().flat_map(char::to_lowercase) {
-        if ch.is_alphanumeric() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    let fingerprint = tokens.join(" ");
+    let fingerprint = content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     if fingerprint.chars().count() < MIN_DEDUPE_FINGERPRINT_CHARS {
         None
     } else {
@@ -237,103 +226,16 @@ fn memories_are_store_duplicates(existing: &MemoryItem, incoming: &MemoryItem) -
     if existing.id == incoming.id {
         return true;
     }
-    if existing.content_fingerprint().is_some()
+    existing.content_fingerprint().is_some()
         && existing.content_fingerprint() == incoming.content_fingerprint()
-    {
-        return true;
-    }
-    memory_items_are_near_duplicates(existing, incoming)
 }
 
 fn memory_index_entry_is_duplicate(entry: &IndexEntry, incoming: &MemoryItem) -> bool {
     if entry.id == incoming.id {
         return true;
     }
-    if incoming.content_fingerprint().is_some()
+    incoming.content_fingerprint().is_some()
         && memory_content_fingerprint(&entry.content_lower) == incoming.content_fingerprint()
-    {
-        return true;
-    }
-    memory_contents_are_near_duplicates(&entry.content_lower, entry.memory_type, incoming)
-}
-
-fn memory_items_are_near_duplicates(existing: &MemoryItem, incoming: &MemoryItem) -> bool {
-    memory_contents_are_near_duplicates(&existing.content, existing.memory_type, incoming)
-}
-
-fn memory_contents_are_near_duplicates(
-    existing_content: &str,
-    existing_type: MemoryType,
-    incoming: &MemoryItem,
-) -> bool {
-    if existing_type != incoming.memory_type {
-        return false;
-    }
-    if has_conflicting_dedupe_polarity(existing_content, &incoming.content) {
-        return false;
-    }
-
-    let existing_terms = dedupe_terms(existing_content);
-    let incoming_terms = dedupe_terms(&incoming.content);
-    if existing_terms.len() < MIN_NEAR_DEDUPE_TERMS || incoming_terms.len() < MIN_NEAR_DEDUPE_TERMS
-    {
-        return false;
-    }
-
-    let overlap = existing_terms.intersection(&incoming_terms).count();
-    let union = existing_terms.len() + incoming_terms.len() - overlap;
-    union > 0 && overlap as f32 / union as f32 >= NEAR_DEDUPE_JACCARD_THRESHOLD
-}
-
-fn dedupe_terms(content: &str) -> HashSet<String> {
-    content
-        .to_ascii_lowercase()
-        .split(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/')))
-        .map(str::trim)
-        .filter(|term| term.chars().count() >= 3)
-        .filter(|term| !is_dedupe_stopword(term))
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn has_conflicting_dedupe_polarity(left: &str, right: &str) -> bool {
-    has_negation_term(left) != has_negation_term(right)
-}
-
-fn has_negation_term(content: &str) -> bool {
-    content
-        .to_ascii_lowercase()
-        .split(|ch: char| !ch.is_alphanumeric())
-        .any(|term| {
-            matches!(
-                term,
-                "not" | "never" | "no" | "avoid" | "without" | "disable"
-            )
-        })
-}
-
-fn is_dedupe_stopword(term: &str) -> bool {
-    matches!(
-        term,
-        "the"
-            | "and"
-            | "for"
-            | "with"
-            | "after"
-            | "before"
-            | "from"
-            | "that"
-            | "this"
-            | "when"
-            | "then"
-            | "than"
-            | "into"
-            | "must"
-            | "should"
-            | "would"
-            | "could"
-            | "about"
-    )
 }
 
 fn merge_duplicate_memory_item(existing: MemoryItem, incoming: MemoryItem) -> MemoryItem {
@@ -1358,6 +1260,22 @@ mod tests {
         assert_eq!(
             merged.metadata.get("supersedes").map(String::as_str),
             Some("old-memory")
+        );
+    }
+
+    #[test]
+    fn test_content_fingerprint_normalizes_only_case_and_whitespace() {
+        let canonical = MemoryItem::new("Use C++ for the native client implementation.");
+        let equivalent = MemoryItem::new("  use C++ for the native client implementation.  ");
+        let distinct = MemoryItem::new("Use C for the native client implementation.");
+
+        assert_eq!(
+            canonical.content_fingerprint(),
+            equivalent.content_fingerprint()
+        );
+        assert_ne!(
+            canonical.content_fingerprint(),
+            distinct.content_fingerprint()
         );
     }
 
