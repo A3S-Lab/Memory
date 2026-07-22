@@ -766,7 +766,7 @@ mod tests {
         let recalled = s.retrieve("first").await.unwrap().unwrap();
         assert!(recalled.tags.contains(&"memory".to_string()));
         assert!(!recalled.tags.contains(&"tests".to_string()));
-        assert!(recalled.metadata.get("duplicate_count").is_none());
+        assert!(!recalled.metadata.contains_key("duplicate_count"));
         assert!(s.retrieve("related").await.unwrap().is_some());
     }
 

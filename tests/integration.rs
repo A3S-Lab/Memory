@@ -295,7 +295,7 @@ async fn contract_store_keeps_distinct_related_content(store: &dyn MemoryStore) 
             && item.tags.contains(&"memory".to_string())));
     assert!(results
         .iter()
-        .all(|item| item.metadata.get("duplicate_count").is_none()));
+        .all(|item| !item.metadata.contains_key("duplicate_count")));
 }
 
 async fn contract_store_keeps_opposite_instructions_distinct(store: &dyn MemoryStore) {
