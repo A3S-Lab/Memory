@@ -4,6 +4,11 @@ Pluggable memory storage for A3S.
 
 Provides the `MemoryStore` trait and two default implementations. Agents that need to persist and recall knowledge across sessions depend on this crate directly — nothing else required.
 
+The crate also provides a separate, dependency-free `VectorIndex` capability
+for caller-owned ephemeral semantic retrieval. Vector indexes are not memory
+stores: callers remain responsible for document admission, embedding
+generation, lifecycle, and result fusion.
+
 Default stores also enforce a small amount of memory hygiene: normalized exact
 duplicates are merged into the existing item, tags/metadata/importance are
 consolidated, and pruning protects curated memories such as pinned, frequently
@@ -81,6 +86,47 @@ impl MemoryStore for MyStore {
 }
 ```
 
+### Ephemeral vector search
+
+`InMemoryVectorIndex` stores caller-supplied vectors in immutable partition
+snapshots and performs exact bounded top-k search. It does not use SQLite,
+persist data, call an embedding model, or spawn a background task. The index is
+released when its final owner is dropped.
+
+```rust
+use a3s_memory::{
+    InMemoryVectorIndex, VectorIndex, VectorIndexDescriptor, VectorRecord,
+    VectorSearchRequest,
+};
+
+let index = InMemoryVectorIndex::new(
+    VectorIndexDescriptor::new(3)
+        .with_max_records(10_000)
+        .with_max_bytes(64 * 1024 * 1024),
+)?;
+
+index
+    .replace_partition(
+        "src/lib.rs",
+        vec![VectorRecord::new("src/lib.rs:1-20", vec![0.8, 0.1, 0.2])
+            .with_label("language", "rust")],
+    )
+    .await?;
+
+let result = index
+    .search(
+        VectorSearchRequest::new(vec![0.7, 0.2, 0.1], 10)
+            .with_label("language", "rust"),
+    )
+    .await?;
+```
+
+Dimensions are selected at index construction. Cosine indexes normalize
+records and queries on admission, reject zero/non-finite vectors, and return
+the immutable index revision that produced each result page. Replacing one
+partition atomically publishes its complete new record set while sharing all
+unchanged partition blocks.
+
 ## Relevance scoring
 
 Search combines lexical match strength (exact phrase, term, tag, and memory-type
@@ -134,6 +180,7 @@ tags or metadata, repeatedly accessed items, and memories carrying
 | `MemoryConfig` (max_short_term, max_working) | `a3s-code` |
 | `MemoryStats` | `a3s-code` |
 | Context injection into agent prompts | `a3s-code` |
+| Workspace scanning, code chunking, embeddings, and hybrid ranking | `a3s-code` |
 
 ## Tests
 

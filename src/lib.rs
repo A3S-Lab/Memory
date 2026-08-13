@@ -10,6 +10,18 @@
 //!
 //! The [`FileMemoryStore`] is the default and requires no additional dependencies.
 
+/// Ephemeral vector indexes for caller-owned semantic retrieval.
+///
+/// This capability is independent from [`MemoryStore`]: callers own document
+/// admission, embedding generation, lifecycle, and result fusion.
+pub mod vector;
+
+pub use vector::{
+    InMemoryVectorIndex, VectorBudgetResource, VectorIndex, VectorIndexDescriptor,
+    VectorIndexError, VectorIndexStatus, VectorMetric, VectorNormalization, VectorRecord,
+    VectorResult, VectorRevision, VectorSearchHit, VectorSearchRequest, VectorSearchResult,
+};
+
 /// SQLite-backed memory store with dual-track Markdown export.
 ///
 /// Requires the `sqlite` Cargo feature.
