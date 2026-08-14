@@ -127,6 +127,10 @@ the immutable index revision that produced each result page. Replacing one
 partition atomically publishes its complete new record set while sharing all
 unchanged partition blocks.
 
+Run the locked release qualification for 25,000 records at 384 dimensions with
+`cargo run --example vector_search_benchmark --release`. It emits JSON evidence
+and fails when exact top-20 search exceeds the 30 ms p95 budget.
+
 ## Relevance scoring
 
 Search combines lexical match strength (exact phrase, term, tag, and memory-type

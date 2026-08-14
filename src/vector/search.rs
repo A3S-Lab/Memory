@@ -15,33 +15,43 @@ pub(super) fn search_snapshot(
 ) -> VectorResult<VectorSearchResult> {
     let mut candidates = BinaryHeap::new();
     let mut searched_records = 0usize;
+    let filter_labels = !request.labels.is_empty();
 
     for (partition_name, partition) in &snapshot.partitions {
         if !request.partitions.is_empty() && !request.partitions.contains(partition_name) {
             continue;
         }
-        for record_index in 0..partition.record_count() {
-            if !labels_match(&partition.labels[record_index], &request.labels) {
+        for (record_index, vector) in partition
+            .vectors
+            .chunks_exact(descriptor.dimension)
+            .enumerate()
+        {
+            if filter_labels && !labels_match(&partition.labels[record_index], &request.labels) {
                 continue;
             }
             searched_records = searched_records
                 .checked_add(1)
                 .ok_or(VectorIndexError::SizeOverflow)?;
-            let score =
-                dot_product_f64(&query, partition.vector(record_index, descriptor.dimension));
+            let score = dot_product_f64(&query, vector);
             if !score.is_finite() || score > f64::from(f32::MAX) || score < f64::from(f32::MIN) {
                 return Err(VectorIndexError::ScoreOverflow {
                     partition: partition_name.clone(),
                     id: partition.ids[record_index].clone(),
                 });
             }
-            candidates.push(ScoredRecord {
+            let candidate = ScoredRecord {
                 partition,
                 record_index,
                 score,
-            });
-            if candidates.len() > request.limit {
+            };
+            if candidates.len() < request.limit {
+                candidates.push(candidate);
+            } else if candidates
+                .peek()
+                .is_some_and(|worst| compare_best_first(&candidate, worst).is_lt())
+            {
                 candidates.pop();
+                candidates.push(candidate);
             }
         }
     }

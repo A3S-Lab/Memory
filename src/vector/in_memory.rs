@@ -48,11 +48,6 @@ impl PartitionBlock {
     pub(super) fn record_count(&self) -> usize {
         self.ids.len()
     }
-
-    pub(super) fn vector(&self, index: usize, dimension: usize) -> &[f32] {
-        let start = index * dimension;
-        &self.vectors[start..start + dimension]
-    }
 }
 
 impl IndexSnapshot {
