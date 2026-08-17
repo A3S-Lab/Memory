@@ -101,7 +101,7 @@ jobs:
             exit 0
           fi
 
-          MESSAGE=$(printf '%s' "$LAST_OUTPUT" | tail -c 1500 | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+          MESSAGE=$(printf '%s' "$LAST_OUTPUT" | tail -c 1500 | tr '\r\n' '  ' | sed 's/%/%25/g')
           echo "::error title=crates.io publish failed::${MESSAGE}"
           exit 1
 
