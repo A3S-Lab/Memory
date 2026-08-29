@@ -187,10 +187,13 @@ target workload. The existing `VectorIndex` remains available independently.
 
 V2 defines behavior, not a mandatory physical representation.
 
-The in-memory implementation is the executable reference contract. Persistent
-backends follow after the conformance suite passes. SQLite, JSON files, keyword
-indexes, vector indexes, relation graphs, and Markdown are backend choices or
-derived projections.
+The in-memory implementation is the executable reference contract. The local
+file backend uses a checksummed, single-writer write-ahead journal and runs the
+same conformance suite. It syncs validated records before publishing them,
+replays idempotently after restart, truncates only an incomplete final record,
+and fails closed on committed-record corruption. SQLite, JSON snapshots,
+keyword indexes, vector indexes, relation graphs, and Markdown remain backend
+choices or derived projections.
 
 Markdown is not made authoritative in the first release. A deterministic
 human-readable projection may be rebuilt from repository state. Bidirectional

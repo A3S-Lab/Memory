@@ -1,4 +1,4 @@
-use super::change_engine::stage_change_set;
+use super::change_engine::{stage_change_set, StagedChange};
 use super::query::query_nodes;
 use super::validation::{validate_required_text, MAX_IDENTIFIER_BYTES};
 use super::{
@@ -60,6 +60,39 @@ impl InMemoryRepository {
         }
     }
 
+    pub(crate) async fn preview_apply(
+        &self,
+        change_set: &MemoryChangeSet,
+    ) -> Result<(MemoryChangeResult, bool), MemoryRepositoryError> {
+        let state = self.state.read().await;
+        let prepared = prepare_change(&state, change_set)?;
+        Ok((prepared.result, prepared.staged.is_none()))
+    }
+
+    pub(crate) async fn preview_admission(
+        &self,
+        event: &MemoryAccessEvent,
+    ) -> Result<bool, MemoryRepositoryError> {
+        self.preview_access(event, AccessKind::Admission).await
+    }
+
+    pub(crate) async fn preview_use(
+        &self,
+        event: &MemoryAccessEvent,
+    ) -> Result<bool, MemoryRepositoryError> {
+        self.preview_access(event, AccessKind::Use).await
+    }
+
+    async fn preview_access(
+        &self,
+        event: &MemoryAccessEvent,
+        kind: AccessKind,
+    ) -> Result<bool, MemoryRepositoryError> {
+        event.validate()?;
+        let state = self.state.read().await;
+        validate_access(&state, event, kind)
+    }
+
     async fn record_access(
         &self,
         event: MemoryAccessEvent,
@@ -67,44 +100,8 @@ impl InMemoryRepository {
     ) -> Result<(), MemoryRepositoryError> {
         event.validate()?;
         let mut state = self.state.write().await;
-        let node = state
-            .nodes
-            .get(&event.namespace)
-            .and_then(|nodes| nodes.get(&event.node_id))
-            .ok_or_else(|| MemoryRepositoryError::NodeNotFound {
-                node_id: event.node_id.clone(),
-            })?;
-        let revision_updated_at =
-            node.revision_updated_at(event.node_revision)
-                .ok_or_else(|| MemoryRepositoryError::NodeRevisionNotFound {
-                    node_id: event.node_id.clone(),
-                    revision: event.node_revision,
-                })?;
-        if event.occurred_at < revision_updated_at {
-            return Err(MemoryRepositoryError::invalid(
-                "accessEvent.occurredAt",
-                "must not precede the referenced node revision",
-            ));
-        }
-
-        let existing = match kind {
-            AccessKind::Admission => state
-                .admissions
-                .get(&event.namespace)
-                .and_then(|events| events.get(&event.id)),
-            AccessKind::Use => state
-                .uses
-                .get(&event.namespace)
-                .and_then(|events| events.get(&event.id)),
-        };
-        if let Some(existing) = existing {
-            return if existing == &event {
-                Ok(())
-            } else {
-                Err(MemoryRepositoryError::IdempotencyConflict {
-                    key: event.id.clone(),
-                })
-            };
+        if validate_access(&state, &event, kind)? {
+            return Ok(());
         }
 
         let current_summary = state
@@ -157,34 +154,10 @@ impl MemoryRepository for InMemoryRepository {
         &self,
         change_set: MemoryChangeSet,
     ) -> Result<MemoryChangeResult, MemoryRepositoryError> {
-        change_set.validate_shape()?;
         let mut state = self.state.write().await;
-
-        if let Some(applied) = state
-            .applied_changes
-            .get(&change_set.namespace)
-            .and_then(|changes| changes.get(&change_set.idempotency_key))
-        {
-            return if applied.change_set == change_set {
-                Ok(applied.result.clone())
-            } else {
-                Err(MemoryRepositoryError::IdempotencyConflict {
-                    key: change_set.idempotency_key,
-                })
-            };
-        }
-
-        let base = state.nodes.get(&change_set.namespace);
-        let mut staged = stage_change_set(&change_set, base)?;
-
-        let result = MemoryChangeResult {
-            idempotency_key: change_set.idempotency_key.clone(),
-            occurred_at: change_set.occurred_at,
-            nodes: staged
-                .changed
-                .iter()
-                .filter_map(|node_id| staged.nodes.get(node_id).cloned())
-                .collect(),
+        let PreparedChange { result, staged } = prepare_change(&state, &change_set)?;
+        let Some(mut staged) = staged else {
+            return Ok(result);
         };
         let namespace_nodes = state.nodes.entry(change_set.namespace.clone()).or_default();
         for node_id in &staged.changed {
@@ -265,5 +238,92 @@ impl MemoryRepository for InMemoryRepository {
             .and_then(|nodes| nodes.get(node_id))
             .copied()
             .unwrap_or_default())
+    }
+}
+
+struct PreparedChange {
+    result: MemoryChangeResult,
+    staged: Option<StagedChange>,
+}
+
+fn prepare_change(
+    state: &RepositoryState,
+    change_set: &MemoryChangeSet,
+) -> Result<PreparedChange, MemoryRepositoryError> {
+    change_set.validate_shape()?;
+    if let Some(applied) = state
+        .applied_changes
+        .get(&change_set.namespace)
+        .and_then(|changes| changes.get(&change_set.idempotency_key))
+    {
+        return if applied.change_set == *change_set {
+            Ok(PreparedChange {
+                result: applied.result.clone(),
+                staged: None,
+            })
+        } else {
+            Err(MemoryRepositoryError::IdempotencyConflict {
+                key: change_set.idempotency_key.clone(),
+            })
+        };
+    }
+
+    let staged = stage_change_set(change_set, state.nodes.get(&change_set.namespace))?;
+    let result = MemoryChangeResult {
+        idempotency_key: change_set.idempotency_key.clone(),
+        occurred_at: change_set.occurred_at,
+        nodes: staged
+            .changed
+            .iter()
+            .filter_map(|node_id| staged.nodes.get(node_id).cloned())
+            .collect(),
+    };
+    Ok(PreparedChange {
+        result,
+        staged: Some(staged),
+    })
+}
+
+fn validate_access(
+    state: &RepositoryState,
+    event: &MemoryAccessEvent,
+    kind: AccessKind,
+) -> Result<bool, MemoryRepositoryError> {
+    let node = state
+        .nodes
+        .get(&event.namespace)
+        .and_then(|nodes| nodes.get(&event.node_id))
+        .ok_or_else(|| MemoryRepositoryError::NodeNotFound {
+            node_id: event.node_id.clone(),
+        })?;
+    let revision_updated_at = node
+        .revision_updated_at(event.node_revision)
+        .ok_or_else(|| MemoryRepositoryError::NodeRevisionNotFound {
+            node_id: event.node_id.clone(),
+            revision: event.node_revision,
+        })?;
+    if event.occurred_at < revision_updated_at {
+        return Err(MemoryRepositoryError::invalid(
+            "accessEvent.occurredAt",
+            "must not precede the referenced node revision",
+        ));
+    }
+
+    let existing = match kind {
+        AccessKind::Admission => state
+            .admissions
+            .get(&event.namespace)
+            .and_then(|events| events.get(&event.id)),
+        AccessKind::Use => state
+            .uses
+            .get(&event.namespace)
+            .and_then(|events| events.get(&event.id)),
+    };
+    match existing {
+        Some(existing) if existing == event => Ok(true),
+        Some(_) => Err(MemoryRepositoryError::IdempotencyConflict {
+            key: event.id.clone(),
+        }),
+        None => Ok(false),
     }
 }

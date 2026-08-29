@@ -21,8 +21,10 @@ sqlite-vec = ["sqlite", "dep:sqlite-vec"]
 async-trait = "0.1"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tokio = { version = "1", features = ["sync", "fs", "rt", "io-util"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
 

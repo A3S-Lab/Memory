@@ -7,6 +7,9 @@ use a3s_memory::repository::{
 use chrono::{DateTime, TimeZone, Utc};
 use std::sync::Arc;
 
+#[path = "support/repository_contract.rs"]
+mod repository_contract;
+
 fn time(second: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 29, 12, 0, second)
         .single()
@@ -52,6 +55,12 @@ fn changes(
     operations: Vec<MemoryOperation>,
 ) -> MemoryChangeSet {
     MemoryChangeSet::new(key, namespace, time(second), operations)
+}
+
+#[tokio::test]
+async fn in_memory_backend_passes_the_reusable_repository_contract() {
+    let repository = InMemoryRepository::new();
+    repository_contract::assert_repository_contract(&repository, "in-memory-contract").await;
 }
 
 #[tokio::test]

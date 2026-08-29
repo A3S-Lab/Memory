@@ -40,10 +40,16 @@ references, typed relations, complete revision history, optimistic concurrency,
 and idempotent atomic change sets. Reads are pure; admission and use are
 recorded explicitly against the exact node revision observed by the host.
 
-`InMemoryRepository` is the executable reference implementation. The existing
-`MemoryItem` and `MemoryStore` API remains source-compatible while hosts migrate
-to V2. Extraction, consolidation policy, embeddings, context admission, and
-scheduling remain owned by the host runtime. See
+`InMemoryRepository` is the executable reference implementation.
+`FileMemoryRepository` adds local durability through a checksummed write-ahead
+journal: validated operations are appended and synced before publication,
+replayed deterministically after restart, and protected by a single-writer
+directory lock. A torn final record is discarded; checksum corruption in a
+committed record fails closed.
+
+The existing `MemoryItem` and `MemoryStore` API remains source-compatible while
+hosts migrate to V2. Extraction, consolidation policy, embeddings, context
+admission, and scheduling remain owned by the host runtime. See
 [`docs/MEMORY_KERNEL_V2.md`](docs/MEMORY_KERNEL_V2.md) for invariants and release
 gates.
 
@@ -205,7 +211,10 @@ tags or metadata, repeatedly accessed items, and memories carrying
 ## Tests
 
 The test suite covers `MemoryItem`, `RelevanceConfig`, `InMemoryStore`,
-`FileMemoryStore`, and the V2 in-memory repository contract. V2 tests cover
+`FileMemoryStore`, and the reusable V2 repository contract. Both V2 backends
+run the same behavior suite; file tests additionally cover restart recovery,
+single-writer locking, torn writes, corruption, and durable concurrency. V2
+tests cover
 namespace isolation, evidence admission, idempotent replay, atomic rollback,
 revision preservation, pure queries, explicit usage records, bounded input,
 and concurrent writers. Enabling the `sqlite` feature also runs the SQLite V1

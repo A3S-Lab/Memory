@@ -48,6 +48,10 @@ pub enum MemoryRepositoryError {
     InvariantViolation {
         message: String,
     },
+    Persistence {
+        operation: String,
+        message: String,
+    },
 }
 
 impl MemoryRepositoryError {
@@ -117,6 +121,12 @@ impl fmt::Display for MemoryRepositoryError {
             ),
             Self::InvariantViolation { message } => {
                 write!(formatter, "memory invariant violated: {message}")
+            }
+            Self::Persistence { operation, message } => {
+                write!(
+                    formatter,
+                    "memory persistence {operation} failed: {message}"
+                )
             }
         }
     }
