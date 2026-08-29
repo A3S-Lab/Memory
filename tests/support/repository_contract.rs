@@ -76,20 +76,22 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
         .await
         .unwrap();
 
+    let active_request = MemorySnapshotRequest::new(namespace.clone(), 4);
     let active_snapshot = repository
-        .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
+        .snapshot_namespace(active_request.clone())
         .await
         .unwrap();
+    active_snapshot.verify(&active_request).unwrap();
     assert_eq!(
-        active_snapshot.profile,
+        active_snapshot.profile(),
         MEMORY_NAMESPACE_SNAPSHOT_PROFILE_V1
     );
-    assert_eq!(active_snapshot.namespace, namespace);
-    assert_eq!(active_snapshot.statuses, [MemoryStatus::Active].into());
-    assert_eq!(active_snapshot.nodes.len(), 1);
-    assert_eq!(active_snapshot.nodes[0].id, "contract-node");
-    assert_eq!(active_snapshot.nodes[0].revision, 2);
-    assert!(active_snapshot.digest.starts_with("sha256:"));
+    assert_eq!(active_snapshot.namespace(), &namespace);
+    assert_eq!(active_snapshot.statuses(), &[MemoryStatus::Active].into());
+    assert_eq!(active_snapshot.nodes().len(), 1);
+    assert_eq!(active_snapshot.nodes()[0].id, "contract-node");
+    assert_eq!(active_snapshot.nodes()[0].revision, 2);
+    assert!(active_snapshot.digest().starts_with("sha256:"));
     assert_eq!(
         repository
             .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
@@ -98,6 +100,11 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
         active_snapshot,
         "an unchanged exact namespace view must have a stable snapshot identity"
     );
+    let mut tampered = serde_json::to_value(&active_snapshot).unwrap();
+    tampered["digest"] = serde_json::json!(format!("sha256:{}", "f".repeat(64)));
+    let tampered = serde_json::from_value(tampered).unwrap();
+    assert!(active_snapshot != tampered);
+    assert!(tampered.verify(&active_request).is_err());
 
     let first_query = repository
         .query(MemoryQuery::new(namespace.clone()).with_text("stable contract"))
@@ -211,14 +218,14 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
         .unwrap();
     assert_eq!(
         current
-            .nodes
+            .nodes()
             .iter()
             .map(|node| node.id.as_str())
             .collect::<Vec<_>>(),
         vec!["contract-cjk-node", "contract-node"],
         "snapshot ordering must be backend-independent"
     );
-    assert_ne!(current.digest, active_snapshot.digest);
+    assert_ne!(current.digest(), active_snapshot.digest());
 
     let overflow = repository
         .snapshot_namespace(MemorySnapshotRequest::new(namespace, 1))

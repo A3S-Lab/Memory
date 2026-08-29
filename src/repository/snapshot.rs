@@ -62,11 +62,59 @@ impl MemorySnapshotRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryNamespaceSnapshot {
-    pub profile: String,
-    pub namespace: MemoryNamespace,
-    pub statuses: BTreeSet<MemoryStatus>,
-    pub nodes: Vec<MemoryNode>,
-    pub digest: String,
+    profile: String,
+    namespace: MemoryNamespace,
+    statuses: BTreeSet<MemoryStatus>,
+    nodes: Vec<MemoryNode>,
+    digest: String,
+}
+
+impl MemoryNamespaceSnapshot {
+    /// Construct and hash a complete caller-provided view.
+    ///
+    /// Custom repositories should use this constructor rather than assembling
+    /// response fields independently.
+    pub fn try_new(
+        request: MemorySnapshotRequest,
+        nodes: Vec<MemoryNode>,
+    ) -> Result<Self, MemoryRepositoryError> {
+        build_snapshot(request, nodes)
+    }
+
+    /// Recompute and verify every response field against the original request.
+    pub fn verify(&self, request: &MemorySnapshotRequest) -> Result<(), MemoryRepositoryError> {
+        let expected = build_snapshot(request.clone(), self.nodes.clone())?;
+        if expected != *self {
+            return Err(MemoryRepositoryError::invariant(
+                "namespace snapshot identity or shape does not match its request",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub fn namespace(&self) -> &MemoryNamespace {
+        &self.namespace
+    }
+
+    pub fn statuses(&self) -> &BTreeSet<MemoryStatus> {
+        &self.statuses
+    }
+
+    pub fn nodes(&self) -> &[MemoryNode] {
+        &self.nodes
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn into_nodes(self) -> Vec<MemoryNode> {
+        self.nodes
+    }
 }
 
 pub(crate) fn snapshot_from_map(
@@ -92,10 +140,17 @@ pub(crate) fn snapshot_from_map(
         .filter(|node| request.statuses.contains(&node.status))
         .cloned()
         .collect();
-    snapshot_from_nodes(request, nodes)
+    MemoryNamespaceSnapshot::try_new(request, nodes)
 }
 
 pub(crate) fn snapshot_from_nodes(
+    request: MemorySnapshotRequest,
+    nodes: Vec<MemoryNode>,
+) -> Result<MemoryNamespaceSnapshot, MemoryRepositoryError> {
+    MemoryNamespaceSnapshot::try_new(request, nodes)
+}
+
+fn build_snapshot(
     request: MemorySnapshotRequest,
     mut nodes: Vec<MemoryNode>,
 ) -> Result<MemoryNamespaceSnapshot, MemoryRepositoryError> {

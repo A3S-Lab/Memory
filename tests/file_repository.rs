@@ -98,7 +98,8 @@ async fn restart_preserves_idempotency_history_and_usage_events() {
             .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
             .await
             .unwrap()
-            .digest;
+            .digest()
+            .to_string();
     }
 
     let reopened = FileMemoryRepository::open(directory.path()).await.unwrap();
@@ -114,7 +115,7 @@ async fn restart_preserves_idempotency_history_and_usage_events() {
             .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
             .await
             .unwrap()
-            .digest,
+            .digest(),
         snapshot_digest
     );
     let usage = reopened.usage_summary(&namespace, "node").await.unwrap();

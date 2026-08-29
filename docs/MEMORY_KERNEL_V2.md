@@ -107,7 +107,9 @@ caller-selected status set under a hard node budget, sorts nodes by stable ID,
 and returns a domain-separated SHA-256 identity for the complete selected view.
 It never truncates. This gives hosts a deterministic source for rebuilding
 derived lexical, vector, or human-readable projections without making those
-projections authoritative.
+projections authoritative. Custom backends construct responses through
+`MemoryNamespaceSnapshot::try_new`; consumers crossing a backend boundary call
+`verify` with the original request before trusting the snapshot identity.
 
 ### Bounded operations
 
