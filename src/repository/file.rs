@@ -1,7 +1,7 @@
 use super::{
     InMemoryRepository, MemoryAccessEvent, MemoryChangeResult, MemoryChangeSet, MemoryNamespace,
-    MemoryNode, MemoryQuery, MemoryQueryResult, MemoryRepository, MemoryRepositoryError,
-    MemoryUsageSummary,
+    MemoryNamespaceSnapshot, MemoryNode, MemoryQuery, MemoryQueryResult, MemoryRepository,
+    MemoryRepositoryError, MemorySnapshotRequest, MemoryUsageSummary,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -199,6 +199,13 @@ impl MemoryRepository for FileMemoryRepository {
 
     async fn query(&self, query: MemoryQuery) -> Result<MemoryQueryResult, MemoryRepositoryError> {
         self.state.inner.query(query).await
+    }
+
+    async fn snapshot_namespace(
+        &self,
+        request: MemorySnapshotRequest,
+    ) -> Result<MemoryNamespaceSnapshot, MemoryRepositoryError> {
+        self.state.inner.snapshot_namespace(request).await
     }
 
     async fn record_admission(

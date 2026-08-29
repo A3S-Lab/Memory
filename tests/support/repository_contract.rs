@@ -1,7 +1,8 @@
 use a3s_memory::repository::{
     DurableMemoryKind, EvidenceKind, EvidenceRef, MemoryAccessEvent, MemoryChangeSet,
-    MemoryNamespace, MemoryNodeDraft, MemoryOperation, MemoryQuery, MemoryRepository, MemoryStatus,
-    RevisionMode,
+    MemoryNamespace, MemoryNodeDraft, MemoryOperation, MemoryQuery, MemoryRepository,
+    MemoryRepositoryError, MemorySnapshotRequest, MemoryStatus, RevisionMode,
+    MEMORY_NAMESPACE_SNAPSHOT_PROFILE_V1,
 };
 use chrono::{TimeZone, Utc};
 
@@ -74,6 +75,29 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
         ))
         .await
         .unwrap();
+
+    let active_snapshot = repository
+        .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
+        .await
+        .unwrap();
+    assert_eq!(
+        active_snapshot.profile,
+        MEMORY_NAMESPACE_SNAPSHOT_PROFILE_V1
+    );
+    assert_eq!(active_snapshot.namespace, namespace);
+    assert_eq!(active_snapshot.statuses, [MemoryStatus::Active].into());
+    assert_eq!(active_snapshot.nodes.len(), 1);
+    assert_eq!(active_snapshot.nodes[0].id, "contract-node");
+    assert_eq!(active_snapshot.nodes[0].revision, 2);
+    assert!(active_snapshot.digest.starts_with("sha256:"));
+    assert_eq!(
+        repository
+            .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
+            .await
+            .unwrap(),
+        active_snapshot,
+        "an unchanged exact namespace view must have a stable snapshot identity"
+    );
 
     let first_query = repository
         .query(MemoryQuery::new(namespace.clone()).with_text("stable contract"))
@@ -174,10 +198,38 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
         .unwrap();
 
     let cjk_query = repository
-        .query(MemoryQuery::new(namespace).with_text("数据库迁移验证"))
+        .query(MemoryQuery::new(namespace.clone()).with_text("数据库迁移验证"))
         .await
         .unwrap();
     assert_eq!(cjk_query.hits.len(), 1);
     assert_eq!(cjk_query.hits[0].node.id, "contract-cjk-node");
     assert!(cjk_query.hits[0].score.lexical > 0.5);
+
+    let current = repository
+        .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        current
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["contract-cjk-node", "contract-node"],
+        "snapshot ordering must be backend-independent"
+    );
+    assert_ne!(current.digest, active_snapshot.digest);
+
+    let overflow = repository
+        .snapshot_namespace(MemorySnapshotRequest::new(namespace, 1))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        overflow,
+        MemoryRepositoryError::LimitExceeded {
+            resource,
+            limit: 1,
+            actual: 2,
+        } if resource == "namespace snapshot nodes"
+    ));
 }

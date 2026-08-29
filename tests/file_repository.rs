@@ -1,7 +1,7 @@
 use a3s_memory::repository::{
     DurableMemoryKind, EvidenceKind, EvidenceRef, FileMemoryRepository, MemoryAccessEvent,
     MemoryChangeSet, MemoryNamespace, MemoryNodeDraft, MemoryOperation, MemoryRepository,
-    MemoryRepositoryError, MemoryStatus, RevisionMode,
+    MemoryRepositoryError, MemorySnapshotRequest, MemoryStatus, RevisionMode,
 };
 use chrono::{TimeZone, Utc};
 use std::fs::OpenOptions;
@@ -63,6 +63,7 @@ async fn restart_preserves_idempotency_history_and_usage_events() {
     let namespace = namespace();
     let create = create_change(&namespace);
     let first_result;
+    let snapshot_digest;
     {
         let repository = FileMemoryRepository::open(directory.path()).await.unwrap();
         first_result = repository.apply(create.clone()).await.unwrap();
@@ -93,6 +94,11 @@ async fn restart_preserves_idempotency_history_and_usage_events() {
             ))
             .await
             .unwrap();
+        snapshot_digest = repository
+            .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
+            .await
+            .unwrap()
+            .digest;
     }
 
     let reopened = FileMemoryRepository::open(directory.path()).await.unwrap();
@@ -103,6 +109,14 @@ async fn restart_preserves_idempotency_history_and_usage_events() {
     let node = reopened.get(&namespace, "node").await.unwrap().unwrap();
     assert_eq!(node.revision, 2);
     assert_eq!(node.history[0].content, "persisted memory");
+    assert_eq!(
+        reopened
+            .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
+            .await
+            .unwrap()
+            .digest,
+        snapshot_digest
+    );
     let usage = reopened.usage_summary(&namespace, "node").await.unwrap();
     assert_eq!(usage.admissions, 1);
     assert_eq!(usage.uses, 0);

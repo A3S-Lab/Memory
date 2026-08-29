@@ -8,6 +8,7 @@ mod file;
 mod graph;
 mod in_memory;
 mod query;
+mod snapshot;
 mod store;
 mod types;
 mod validation;
@@ -19,6 +20,10 @@ pub use file::FileMemoryRepository;
 pub use in_memory::InMemoryRepository;
 pub use query::{
     MemoryQuery, MemoryQueryHit, MemoryQueryResult, MemoryScore, MEMORY_LEXICAL_QUERY_PROFILE_V1,
+};
+pub use snapshot::{
+    MemoryNamespaceSnapshot, MemorySnapshotRequest, MAX_SNAPSHOT_NODES,
+    MEMORY_NAMESPACE_SNAPSHOT_PROFILE_V1,
 };
 pub use store::MemoryRepository;
 pub use types::{

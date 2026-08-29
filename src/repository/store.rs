@@ -1,6 +1,7 @@
 use super::{
-    MemoryAccessEvent, MemoryChangeResult, MemoryChangeSet, MemoryNamespace, MemoryNode,
-    MemoryQuery, MemoryQueryResult, MemoryRepositoryError, MemoryUsageSummary,
+    MemoryAccessEvent, MemoryChangeResult, MemoryChangeSet, MemoryNamespace,
+    MemoryNamespaceSnapshot, MemoryNode, MemoryQuery, MemoryQueryResult, MemoryRepositoryError,
+    MemorySnapshotRequest, MemoryUsageSummary, MAX_QUERY_LIMIT,
 };
 
 /// Repository contract for evidence-backed durable memory.
@@ -21,6 +22,36 @@ pub trait MemoryRepository: Send + Sync {
 
     /// Query one exact namespace without mutating repository state.
     async fn query(&self, query: MemoryQuery) -> Result<MemoryQueryResult, MemoryRepositoryError>;
+
+    /// Capture one complete, bounded, deterministic namespace view.
+    ///
+    /// The default implementation is exact below the ordinary query horizon.
+    /// Backends that can atomically enumerate larger views should override it.
+    async fn snapshot_namespace(
+        &self,
+        request: MemorySnapshotRequest,
+    ) -> Result<MemoryNamespaceSnapshot, MemoryRepositoryError> {
+        request.validate()?;
+        let query_limit = request.max_nodes.saturating_add(1).min(MAX_QUERY_LIMIT);
+        let result = self
+            .query(
+                MemoryQuery::new(request.namespace.clone())
+                    .with_statuses(request.statuses.iter().copied())
+                    .with_limit(query_limit),
+            )
+            .await?;
+        if request.max_nodes >= MAX_QUERY_LIMIT && result.hits.len() == MAX_QUERY_LIMIT {
+            return Err(MemoryRepositoryError::LimitExceeded {
+                resource: "namespace snapshot query horizon".into(),
+                limit: MAX_QUERY_LIMIT - 1,
+                actual: MAX_QUERY_LIMIT,
+            });
+        }
+        super::snapshot::snapshot_from_nodes(
+            request,
+            result.hits.into_iter().map(|hit| hit.node).collect(),
+        )
+    }
 
     /// Record that the host admitted the current active node revision into a model context.
     async fn record_admission(&self, event: MemoryAccessEvent)

@@ -20,6 +20,7 @@ transport.
 - typed memory nodes, evidence references, relations, and lifecycle states;
 - idempotent and revision-checked atomic changes;
 - pure reads and queries;
+- complete bounded namespace snapshots for rebuilding caller-owned projections;
 - explicit admission and use records;
 - backend conformance and rebuildable derived indexes.
 
@@ -101,11 +102,20 @@ Admission accepts only the current `Active` revision, preventing a stale or
 concurrently superseded snapshot from entering a new model context. Use may
 still cite a historical revision for later audit.
 
+`snapshot_namespace` is also a pure read. It captures one exact namespace and
+caller-selected status set under a hard node budget, sorts nodes by stable ID,
+and returns a domain-separated SHA-256 identity for the complete selected view.
+It never truncates. This gives hosts a deterministic source for rebuilding
+derived lexical, vector, or human-readable projections without making those
+projections authoritative.
+
 ### Bounded operations
 
 Queries have validated finite limits. Change sets have a finite operation cap.
 Node content, evidence, relations, labels, and identifiers have explicit size
-limits. A backend must reject over-budget input before changing state.
+limits. Namespace snapshots have a caller-selected node limit beneath a kernel
+hard cap and fail when the complete selected view does not fit. A backend must
+reject over-budget input before changing state or returning a partial view.
 
 ## Core Model
 
@@ -251,6 +261,8 @@ The V2 kernel is not complete until tests prove:
 - stale revisions cannot partially apply;
 - correction and supersession preserve prior revisions;
 - query operations leave repository state unchanged;
+- namespace snapshots are complete, deterministically ordered and hashed, and
+  reject over-budget views without truncation across every conforming backend;
 - the shared in-memory/file contract retrieves partial CJK phrases under the
   exact versioned lexical profile without adding single-character matching;
 - admission and use events are independently idempotent, and stale/inactive

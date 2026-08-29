@@ -40,7 +40,10 @@ references, typed relations, complete revision history, optimistic concurrency,
 and idempotent atomic change sets. Candidate activation requires new decision
 evidence so an LLM annotation cannot silently become serving state. Reads are
 pure; admission and use are recorded explicitly against the exact node revision
-observed by the host.
+observed by the host. Hosts rebuilding derived projections can request a
+complete bounded namespace snapshot: the repository filters an exact status
+set, orders nodes deterministically, returns a stable SHA-256 view identity,
+and rejects an over-budget view instead of silently truncating it.
 
 The deterministic V2 lexical profile preserves lowercased alphanumeric words
 and adds overlapping bigrams for contiguous Chinese, Japanese, and Korean text.
@@ -227,8 +230,9 @@ single-writer locking, torn writes, corruption, and durable concurrency. V2
 tests cover
 namespace isolation, evidence admission, idempotent replay, atomic rollback,
 revision preservation, pure queries, explicit usage records, bounded input,
-deterministic word/CJK-bigram retrieval across both V2 backends, and concurrent
-writers. Enabling the `sqlite` feature also runs the SQLite V1 backend contract.
+complete namespace-snapshot identity and overflow behavior, deterministic
+word/CJK-bigram retrieval across both V2 backends, and concurrent writers.
+Enabling the `sqlite` feature also runs the SQLite V1 backend contract.
 
 ```sh
 cargo test

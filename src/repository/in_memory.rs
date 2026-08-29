@@ -1,10 +1,11 @@
 use super::change_engine::{stage_change_set, StagedChange};
 use super::query::query_nodes;
+use super::snapshot::snapshot_from_map;
 use super::validation::{validate_required_text, MAX_IDENTIFIER_BYTES};
 use super::{
-    MemoryAccessEvent, MemoryChangeResult, MemoryChangeSet, MemoryNamespace, MemoryNode,
-    MemoryQuery, MemoryQueryResult, MemoryRepository, MemoryRepositoryError,
-    MemoryRepositorySnapshot, MemoryUsageSummary,
+    MemoryAccessEvent, MemoryChangeResult, MemoryChangeSet, MemoryNamespace,
+    MemoryNamespaceSnapshot, MemoryNode, MemoryQuery, MemoryQueryResult, MemoryRepository,
+    MemoryRepositoryError, MemoryRepositorySnapshot, MemorySnapshotRequest, MemoryUsageSummary,
 };
 use std::collections::BTreeMap;
 use tokio::sync::RwLock;
@@ -201,6 +202,15 @@ impl MemoryRepository for InMemoryRepository {
         query.validate()?;
         let state = self.state.read().await;
         Ok(query_nodes(state.nodes.get(&query.namespace), &query))
+    }
+
+    async fn snapshot_namespace(
+        &self,
+        request: MemorySnapshotRequest,
+    ) -> Result<MemoryNamespaceSnapshot, MemoryRepositoryError> {
+        request.validate()?;
+        let state = self.state.read().await;
+        snapshot_from_map(state.nodes.get(&request.namespace), request)
     }
 
     async fn record_admission(
