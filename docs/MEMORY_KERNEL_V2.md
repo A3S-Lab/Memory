@@ -184,9 +184,15 @@ A query is scoped to one exact namespace and can filter by text, kinds, and
 statuses. The default status filter is `Active`. Results contain immutable node
 snapshots plus retrieval score details. Queries are pure.
 
-The reference repository implements deterministic lexical matching. Vector
-retrieval remains caller-owned until an evaluation proves that it improves the
-target workload. The existing `VectorIndex` remains available independently.
+The reference repository implements the versioned deterministic lexical
+profile exposed as `MEMORY_LEXICAL_QUERY_PROFILE_V1`. It preserves lowercased
+alphanumeric words and adds the complete span plus overlapping character
+bigrams for contiguous Chinese, Japanese, and Korean runs. Bigrams recover
+shared same-language phrases without the false-positive pressure of CJK
+unigrams. They do not infer translated or no-overlap semantic equivalence.
+Vector retrieval remains caller-owned until an evaluation proves that it
+improves the target workload. The existing `VectorIndex` remains available
+independently.
 
 ## Storage and Projection
 
@@ -245,6 +251,8 @@ The V2 kernel is not complete until tests prove:
 - stale revisions cannot partially apply;
 - correction and supersession preserve prior revisions;
 - query operations leave repository state unchanged;
+- the shared in-memory/file contract retrieves partial CJK phrases under the
+  exact versioned lexical profile without adding single-character matching;
 - admission and use events are independently idempotent, and stale/inactive
   revisions cannot be newly admitted;
 - invalid and over-budget inputs leave state unchanged;

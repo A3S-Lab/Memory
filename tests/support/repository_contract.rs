@@ -133,4 +133,51 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
     assert_eq!(corrected.revision, 3);
     assert_eq!(corrected.history.len(), 2);
     assert_eq!(corrected.history[0].content, "remember the stable contract");
+
+    repository
+        .apply(MemoryChangeSet::new(
+            "contract-create-cjk",
+            namespace.clone(),
+            time(5),
+            vec![MemoryOperation::Create {
+                node: MemoryNodeDraft::new(
+                    "contract-cjk-node",
+                    namespace.clone(),
+                    DurableMemoryKind::Procedural,
+                    MemoryStatus::Candidate,
+                    "部署前执行数据库迁移并验证架构版本",
+                    vec![evidence("cjk-create", 5)],
+                    time(5),
+                ),
+            }],
+        ))
+        .await
+        .unwrap();
+    repository
+        .apply(MemoryChangeSet::new(
+            "contract-activate-cjk",
+            namespace.clone(),
+            time(6),
+            vec![MemoryOperation::Activate {
+                node_id: "contract-cjk-node".into(),
+                expected_revision: 1,
+                evidence: vec![EvidenceRef::try_new(
+                    "a3s://contract/review/cjk-activation",
+                    format!("sha256:{:0>64}", "cjk-activation"),
+                    EvidenceKind::Verification,
+                    time(6),
+                )
+                .unwrap()],
+            }],
+        ))
+        .await
+        .unwrap();
+
+    let cjk_query = repository
+        .query(MemoryQuery::new(namespace).with_text("数据库迁移验证"))
+        .await
+        .unwrap();
+    assert_eq!(cjk_query.hits.len(), 1);
+    assert_eq!(cjk_query.hits[0].node.id, "contract-cjk-node");
+    assert!(cjk_query.hits[0].score.lexical > 0.5);
 }

@@ -42,6 +42,14 @@ evidence so an LLM annotation cannot silently become serving state. Reads are
 pure; admission and use are recorded explicitly against the exact node revision
 observed by the host.
 
+The deterministic V2 lexical profile preserves lowercased alphanumeric words
+and adds overlapping bigrams for contiguous Chinese, Japanese, and Korean text.
+This makes ordinary same-language CJK phrase variation searchable without a
+model or egress while avoiding noisy single-character matching. Hosts can bind
+`MEMORY_LEXICAL_QUERY_PROFILE_V1` to detect algorithm drift. The profile is not
+cross-language semantic retrieval: translated or no-overlap paraphrases still
+require a caller-owned evaluated retrieval extension.
+
 `InMemoryRepository` is the executable reference implementation.
 `FileMemoryRepository` adds local durability through a checksummed write-ahead
 journal: validated operations are appended and synced before publication,
@@ -219,8 +227,8 @@ single-writer locking, torn writes, corruption, and durable concurrency. V2
 tests cover
 namespace isolation, evidence admission, idempotent replay, atomic rollback,
 revision preservation, pure queries, explicit usage records, bounded input,
-and concurrent writers. Enabling the `sqlite` feature also runs the SQLite V1
-backend contract.
+deterministic word/CJK-bigram retrieval across both V2 backends, and concurrent
+writers. Enabling the `sqlite` feature also runs the SQLite V1 backend contract.
 
 ```sh
 cargo test

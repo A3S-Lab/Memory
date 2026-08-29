@@ -17,7 +17,9 @@ pub use change::{MemoryChangeResult, MemoryChangeSet, MemoryOperation};
 pub use error::MemoryRepositoryError;
 pub use file::FileMemoryRepository;
 pub use in_memory::InMemoryRepository;
-pub use query::{MemoryQuery, MemoryQueryHit, MemoryQueryResult, MemoryScore};
+pub use query::{
+    MemoryQuery, MemoryQueryHit, MemoryQueryResult, MemoryScore, MEMORY_LEXICAL_QUERY_PROFILE_V1,
+};
 pub use store::MemoryRepository;
 pub use types::{
     DurableMemoryKind, EvidenceKind, EvidenceRef, MemoryNamespace, MemoryNode, MemoryNodeDraft,
