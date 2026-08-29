@@ -189,19 +189,50 @@ async fn active_nodes_require_evidence_and_candidates_need_explicit_activation()
             vec![MemoryOperation::Activate {
                 node_id: "candidate".into(),
                 expected_revision: 1,
+                evidence: vec![EvidenceRef::try_new(
+                    "a3s://review/activation/candidate",
+                    format!("sha256:{:0>64}", "activation"),
+                    EvidenceKind::Verification,
+                    time(3),
+                )
+                .unwrap()],
             }],
         ))
         .await
         .unwrap();
+    let active = repository.get(&ns, "candidate").await.unwrap().unwrap();
+    assert_eq!(active.evidence.len(), 2);
+    assert!(active
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == EvidenceKind::Verification));
     assert_eq!(
         repository
-            .query(MemoryQuery::new(ns))
+            .query(MemoryQuery::new(ns.clone()))
             .await
             .unwrap()
             .hits
             .len(),
         1
     );
+
+    let missing_decision_evidence = repository
+        .apply(changes(
+            ns,
+            "activate-without-decision-evidence",
+            4,
+            vec![MemoryOperation::Activate {
+                node_id: "candidate".into(),
+                expected_revision: 2,
+                evidence: Vec::new(),
+            }],
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing_decision_evidence,
+        MemoryRepositoryError::EvidenceRequired { .. }
+    ));
 }
 
 #[tokio::test]

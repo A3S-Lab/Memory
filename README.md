@@ -37,8 +37,10 @@ The additive `repository` module provides the policy-free integrity kernel for
 evidence-backed durable memory. It adds exact tenant/principal/scope
 namespaces, candidate-to-active lifecycle transitions, immutable evidence
 references, typed relations, complete revision history, optimistic concurrency,
-and idempotent atomic change sets. Reads are pure; admission and use are
-recorded explicitly against the exact node revision observed by the host.
+and idempotent atomic change sets. Candidate activation requires new decision
+evidence so an LLM annotation cannot silently become serving state. Reads are
+pure; admission and use are recorded explicitly against the exact node revision
+observed by the host.
 
 `InMemoryRepository` is the executable reference implementation.
 `FileMemoryRepository` adds local durability through a checksummed write-ahead

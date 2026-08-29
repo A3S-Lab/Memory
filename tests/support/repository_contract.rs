@@ -63,6 +63,13 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
             vec![MemoryOperation::Activate {
                 node_id: "contract-node".into(),
                 expected_revision: 1,
+                evidence: vec![EvidenceRef::try_new(
+                    "a3s://contract/review/activation",
+                    format!("sha256:{:0>64}", "activation"),
+                    EvidenceKind::Verification,
+                    time(2),
+                )
+                .unwrap()],
             }],
         ))
         .await

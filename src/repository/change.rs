@@ -18,6 +18,8 @@ pub enum MemoryOperation {
     Activate {
         node_id: String,
         expected_revision: u64,
+        /// New evidence for the explicit activation decision.
+        evidence: Vec<EvidenceRef>,
     },
     Corroborate {
         node_id: String,

@@ -58,7 +58,9 @@ source event occurred.
 
 LLM confidence and importance values are annotations, not evidence. A runtime
 may create inferred material as `Candidate`, but only an explicit lifecycle
-change may make it `Active`.
+change carrying new Manual or Verification decision evidence may make it
+`Active`. The activation revision preserves both the proposal evidence and the
+separate decision evidence.
 
 ### Non-destructive evolution
 
@@ -163,7 +165,7 @@ A change set contains an idempotency key, namespace, occurrence time, and a
 bounded sequence of operations. Initial operations are:
 
 - create a candidate or active node;
-- activate a candidate;
+- activate a candidate with new decision evidence;
 - corroborate with new evidence;
 - refine or correct content with new evidence;
 - add or remove a relation;
@@ -235,7 +237,7 @@ compatibility. V2 must not repeat that behavior.
 The V2 kernel is not complete until tests prove:
 
 - zero cross-namespace reads, writes, deduplication, or relations;
-- every active derived node has evidence;
+- every active derived node has proposal and activation-decision evidence;
 - identical replay is idempotent and conflicting replay is rejected;
 - stale revisions cannot partially apply;
 - correction and supersession preserve prior revisions;

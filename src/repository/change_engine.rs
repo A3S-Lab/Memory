@@ -100,17 +100,22 @@ fn apply_operation(
         MemoryOperation::Activate {
             node_id,
             expected_revision,
+            evidence,
         } => {
+            if evidence.is_empty() {
+                return Err(MemoryRepositoryError::EvidenceRequired {
+                    node_id: node_id.clone(),
+                });
+            }
+            validate_evidence_times(evidence, change_set)?;
             let node = node_for_update(node_id, *expected_revision, base, staged)?;
             if node.status != MemoryStatus::Candidate {
                 return Err(invalid_transition(node, MemoryStatus::Active));
             }
-            if node.evidence.is_empty() {
-                return Err(MemoryRepositoryError::EvidenceRequired {
-                    node_id: node.id.clone(),
-                });
-            }
+            validate_new_evidence(node, evidence)?;
             node.begin_revision(change_set.occurred_at, MemoryRevisionKind::Activated)?;
+            node.evidence.extend(evidence.iter().cloned());
+            node.evidence.sort();
             node.status = MemoryStatus::Active;
             changed.insert(node_id.clone());
         }
