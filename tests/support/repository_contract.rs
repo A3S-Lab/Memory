@@ -76,7 +76,7 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
         .await
         .unwrap();
 
-    let active_request = MemorySnapshotRequest::new(namespace.clone(), 4);
+    let active_request = MemorySnapshotRequest::new(namespace.clone(), 4, 1024 * 1024);
     let active_snapshot = repository
         .snapshot_namespace(active_request.clone())
         .await
@@ -91,10 +91,15 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
     assert_eq!(active_snapshot.nodes().len(), 1);
     assert_eq!(active_snapshot.nodes()[0].id, "contract-node");
     assert_eq!(active_snapshot.nodes()[0].revision, 2);
+    assert!(active_snapshot.byte_count() > 0);
     assert!(active_snapshot.digest().starts_with("sha256:"));
     assert_eq!(
         repository
-            .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
+            .snapshot_namespace(MemorySnapshotRequest::new(
+                namespace.clone(),
+                4,
+                1024 * 1024,
+            ))
             .await
             .unwrap(),
         active_snapshot,
@@ -213,7 +218,11 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
     assert!(cjk_query.hits[0].score.lexical > 0.5);
 
     let current = repository
-        .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 2))
+        .snapshot_namespace(MemorySnapshotRequest::new(
+            namespace.clone(),
+            2,
+            1024 * 1024,
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -228,7 +237,11 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
     assert_ne!(current.digest(), active_snapshot.digest());
 
     let overflow = repository
-        .snapshot_namespace(MemorySnapshotRequest::new(namespace, 1))
+        .snapshot_namespace(MemorySnapshotRequest::new(
+            namespace.clone(),
+            1,
+            1024 * 1024,
+        ))
         .await
         .unwrap_err();
     assert!(matches!(
@@ -238,5 +251,18 @@ pub async fn assert_repository_contract(repository: &dyn MemoryRepository, scope
             limit: 1,
             actual: 2,
         } if resource == "namespace snapshot nodes"
+    ));
+
+    let byte_overflow = repository
+        .snapshot_namespace(MemorySnapshotRequest::new(namespace, 2, 1))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        byte_overflow,
+        MemoryRepositoryError::LimitExceeded {
+            resource,
+            limit: 1,
+            actual,
+        } if resource == "namespace snapshot bytes" && actual > 1
     ));
 }

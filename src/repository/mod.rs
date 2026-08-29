@@ -22,7 +22,7 @@ pub use query::{
     MemoryQuery, MemoryQueryHit, MemoryQueryResult, MemoryScore, MEMORY_LEXICAL_QUERY_PROFILE_V1,
 };
 pub use snapshot::{
-    MemoryNamespaceSnapshot, MemorySnapshotRequest, MAX_SNAPSHOT_NODES,
+    MemoryNamespaceSnapshot, MemorySnapshotRequest, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_NODES,
     MEMORY_NAMESPACE_SNAPSHOT_PROFILE_V1,
 };
 pub use store::MemoryRepository;

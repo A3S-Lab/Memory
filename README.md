@@ -42,10 +42,10 @@ evidence so an LLM annotation cannot silently become serving state. Reads are
 pure; admission and use are recorded explicitly against the exact node revision
 observed by the host. Hosts rebuilding derived projections can request a
 complete bounded namespace snapshot: the repository filters an exact status
-set, orders nodes deterministically, returns a stable SHA-256 view identity,
-and rejects an over-budget view instead of silently truncating it. Snapshot
-responses can be recomputed against their original request, so hosts need not
-trust a custom backend's claimed digest.
+set, orders nodes deterministically, streams a stable SHA-256 view identity,
+and rejects a node- or canonical-byte-over-budget view instead of silently
+truncating it. Snapshot responses can be recomputed against their original
+request, so hosts need not trust a custom backend's claimed digest.
 
 The deterministic V2 lexical profile preserves lowercased alphanumeric words
 and adds overlapping bigrams for contiguous Chinese, Japanese, and Korean text.

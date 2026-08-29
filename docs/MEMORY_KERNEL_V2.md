@@ -103,11 +103,12 @@ concurrently superseded snapshot from entering a new model context. Use may
 still cite a historical revision for later audit.
 
 `snapshot_namespace` is also a pure read. It captures one exact namespace and
-caller-selected status set under a hard node budget, sorts nodes by stable ID,
-and returns a domain-separated SHA-256 identity for the complete selected view.
-It never truncates. This gives hosts a deterministic source for rebuilding
-derived lexical, vector, or human-readable projections without making those
-projections authoritative. Custom backends construct responses through
+caller-selected status set under hard node and canonical-payload byte budgets,
+sorts nodes by stable ID, and streams a domain-separated SHA-256 identity for
+the complete selected view without first allocating the encoded payload. It
+never truncates. This gives hosts a deterministic source for rebuilding derived
+lexical, vector, or human-readable projections without making those projections
+authoritative. Custom backends construct responses through
 `MemoryNamespaceSnapshot::try_new`; consumers crossing a backend boundary call
 `verify` with the original request before trusting the snapshot identity.
 
@@ -115,9 +116,10 @@ projections authoritative. Custom backends construct responses through
 
 Queries have validated finite limits. Change sets have a finite operation cap.
 Node content, evidence, relations, labels, and identifiers have explicit size
-limits. Namespace snapshots have a caller-selected node limit beneath a kernel
-hard cap and fail when the complete selected view does not fit. A backend must
-reject over-budget input before changing state or returning a partial view.
+limits. Namespace snapshots have caller-selected node and byte limits beneath
+kernel hard caps and fail when the complete selected view does not fit. A
+backend must reject over-budget input before changing state, cloning an
+over-budget built-in view, or returning a partial view.
 
 ## Core Model
 
@@ -264,7 +266,8 @@ The V2 kernel is not complete until tests prove:
 - correction and supersession preserve prior revisions;
 - query operations leave repository state unchanged;
 - namespace snapshots are complete, deterministically ordered and hashed, and
-  reject over-budget views without truncation across every conforming backend;
+  reject node- or byte-over-budget views without truncation across every
+  conforming backend;
 - the shared in-memory/file contract retrieves partial CJK phrases under the
   exact versioned lexical profile without adding single-character matching;
 - admission and use events are independently idempotent, and stale/inactive

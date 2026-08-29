@@ -95,7 +95,11 @@ async fn restart_preserves_idempotency_history_and_usage_events() {
             .await
             .unwrap();
         snapshot_digest = repository
-            .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
+            .snapshot_namespace(MemorySnapshotRequest::new(
+                namespace.clone(),
+                4,
+                1024 * 1024,
+            ))
             .await
             .unwrap()
             .digest()
@@ -112,7 +116,11 @@ async fn restart_preserves_idempotency_history_and_usage_events() {
     assert_eq!(node.history[0].content, "persisted memory");
     assert_eq!(
         reopened
-            .snapshot_namespace(MemorySnapshotRequest::new(namespace.clone(), 4))
+            .snapshot_namespace(MemorySnapshotRequest::new(
+                namespace.clone(),
+                4,
+                1024 * 1024,
+            ))
             .await
             .unwrap()
             .digest(),
