@@ -31,6 +31,22 @@ The crate follows a minimal core + external extensions pattern:
 
 Three-tier session memory (`AgentMemory`) and context injection (`MemoryContextProvider`) live in `a3s-code`, not here. This crate only owns the storage layer.
 
+### Durable repository V2
+
+The additive `repository` module provides the policy-free integrity kernel for
+evidence-backed durable memory. It adds exact tenant/principal/scope
+namespaces, candidate-to-active lifecycle transitions, immutable evidence
+references, typed relations, complete revision history, optimistic concurrency,
+and idempotent atomic change sets. Reads are pure; admission and use are
+recorded explicitly against the exact node revision observed by the host.
+
+`InMemoryRepository` is the executable reference implementation. The existing
+`MemoryItem` and `MemoryStore` API remains source-compatible while hosts migrate
+to V2. Extraction, consolidation policy, embeddings, context admission, and
+scheduling remain owned by the host runtime. See
+[`docs/MEMORY_KERNEL_V2.md`](docs/MEMORY_KERNEL_V2.md) for invariants and release
+gates.
+
 ## Usage
 
 ```toml
@@ -188,11 +204,12 @@ tags or metadata, repeatedly accessed items, and memories carrying
 
 ## Tests
 
-The test suite covers `MemoryItem`, `RelevanceConfig`, `InMemoryStore`, and
-`FileMemoryStore`, including persistence, index rebuild, path traversal
-prevention, search specificity, exact duplicate consolidation, preservation of
-distinct related memories, and protected pruning. Enabling the `sqlite` feature
-also runs the SQLite backend contract.
+The test suite covers `MemoryItem`, `RelevanceConfig`, `InMemoryStore`,
+`FileMemoryStore`, and the V2 in-memory repository contract. V2 tests cover
+namespace isolation, evidence admission, idempotent replay, atomic rollback,
+revision preservation, pure queries, explicit usage records, bounded input,
+and concurrent writers. Enabling the `sqlite` feature also runs the SQLite V1
+backend contract.
 
 ```sh
 cargo test

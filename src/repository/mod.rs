@@ -1,0 +1,28 @@
+//! Policy-free integrity kernel for durable agent memory.
+
+mod access;
+mod change;
+mod change_engine;
+mod error;
+mod graph;
+mod in_memory;
+mod query;
+mod store;
+mod types;
+mod validation;
+
+pub use access::{MemoryAccessEvent, MemoryRepositorySnapshot, MemoryUsageSummary};
+pub use change::{MemoryChangeResult, MemoryChangeSet, MemoryOperation};
+pub use error::MemoryRepositoryError;
+pub use in_memory::InMemoryRepository;
+pub use query::{MemoryQuery, MemoryQueryHit, MemoryQueryResult, MemoryScore};
+pub use store::MemoryRepository;
+pub use types::{
+    DurableMemoryKind, EvidenceKind, EvidenceRef, MemoryNamespace, MemoryNode, MemoryNodeDraft,
+    MemoryNodeRevision, MemoryRelation, MemoryRelationKind, MemoryRevisionKind, MemoryStatus,
+    RevisionMode,
+};
+pub use validation::{
+    MAX_CHANGE_OPERATIONS, MAX_CONTENT_BYTES, MAX_EVIDENCE_PER_NODE, MAX_IDENTIFIER_BYTES,
+    MAX_LABELS_PER_NODE, MAX_QUERY_LIMIT, MAX_RELATIONS_PER_NODE, MAX_REVISIONS_PER_NODE,
+};

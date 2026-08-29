@@ -10,6 +10,13 @@
 //!
 //! The [`FileMemoryStore`] is the default and requires no additional dependencies.
 
+/// Evidence-backed, namespace-isolated durable memory repository.
+///
+/// This additive V2 API keeps retrieval pure and applies bounded multi-node
+/// changes atomically. The existing [`MemoryStore`] API remains available for
+/// backwards compatibility.
+pub mod repository;
+
 /// Ephemeral vector indexes for caller-owned semantic retrieval.
 ///
 /// This capability is independent from [`MemoryStore`]: callers own document

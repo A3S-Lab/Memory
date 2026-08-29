@@ -93,7 +93,8 @@ retention state. Retrieval observation is split into explicit events:
 - `record_use`: the node was cited, selected, or otherwise used by the host.
 
 Candidate generation, retrieval, admission, and use therefore remain distinct
-and auditable.
+and auditable. Each admission or use event names the exact node revision that
+was observed; the repository rejects references to revisions that do not exist.
 
 ### Bounded operations
 
