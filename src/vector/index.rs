@@ -1,6 +1,6 @@
 use super::{
-    VectorIndexDescriptor, VectorIndexStatus, VectorRecord, VectorResult, VectorSearchRequest,
-    VectorSearchResult,
+    VectorIndexDescriptor, VectorIndexError, VectorIndexStatus, VectorMutationConsistency,
+    VectorRecord, VectorResult, VectorRevision, VectorSearchRequest, VectorSearchResult,
 };
 
 /// A bounded vector index whose content and lifecycle are owned by its caller.
@@ -16,6 +16,12 @@ pub trait VectorIndex: Send + Sync {
     /// Return the latest published status without waiting for background work.
     fn status(&self) -> VectorIndexStatus;
 
+    /// Return the strongest partition-mutation ordering contract implemented
+    /// by this backend.
+    fn mutation_consistency(&self) -> VectorMutationConsistency {
+        VectorMutationConsistency::PartitionAtomic
+    }
+
     /// Atomically replace every record in `partition`.
     ///
     /// Replacing an existing partition with an empty record list removes it.
@@ -26,8 +32,33 @@ pub trait VectorIndex: Send + Sync {
         records: Vec<VectorRecord>,
     ) -> VectorResult<VectorIndexStatus>;
 
+    /// Atomically replace one partition only when the complete index still has
+    /// `expected_revision`.
+    ///
+    /// Implementations advertising `IndexRevisionCas` must compare and mutate
+    /// at one linearization point. The default fails closed so a custom backend
+    /// cannot accidentally claim cross-writer ordering from a check-then-write.
+    async fn replace_partition_if_revision(
+        &self,
+        _partition: &str,
+        _expected_revision: VectorRevision,
+        _records: Vec<VectorRecord>,
+    ) -> VectorResult<VectorIndexStatus> {
+        Err(VectorIndexError::ConditionalMutationUnsupported)
+    }
+
     /// Atomically remove one partition. Missing partitions are a no-op.
     async fn remove_partition(&self, partition: &str) -> VectorResult<VectorIndexStatus>;
+
+    /// Atomically remove one partition only when the complete index still has
+    /// `expected_revision`.
+    async fn remove_partition_if_revision(
+        &self,
+        _partition: &str,
+        _expected_revision: VectorRevision,
+    ) -> VectorResult<VectorIndexStatus> {
+        Err(VectorIndexError::ConditionalMutationUnsupported)
+    }
 
     /// Search one immutable index revision.
     async fn search(&self, request: VectorSearchRequest) -> VectorResult<VectorSearchResult>;

@@ -112,6 +112,18 @@ authoritative. Custom backends construct responses through
 `MemoryNamespaceSnapshot::try_new`; consumers crossing a backend boundary call
 `verify` with the original request before trusting the snapshot identity.
 
+The caller-owned `VectorIndex` exposes its mutation consistency separately from
+repository truth. `partition_atomic` guarantees that searches never observe a
+partially replaced partition. `index_revision_cas` additionally compares an
+expected global index revision and publishes replacement or removal at the same
+linearization point. This prevents delayed derived-index writers and cleanup
+tasks from overwriting a newer generation when every writer uses the
+conditional API. The in-memory reference index implements this contract;
+custom backends default to source-compatible atomic replacement and reject
+conditional mutation until they implement it. CAS is intentionally global and
+may reject on unrelated partition churn. It is not a distributed lease, a
+durable remote backend, or permission to treat vectors as authoritative.
+
 ### Bounded operations
 
 Queries have validated finite limits. Change sets have a finite operation cap.

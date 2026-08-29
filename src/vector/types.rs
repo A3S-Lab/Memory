@@ -155,6 +155,24 @@ impl VectorRevision {
     }
 }
 
+/// Strongest mutation ordering contract exposed by one vector backend.
+///
+/// `IndexRevisionCas` means the backend compares the expected global index
+/// revision and publishes the partition mutation at the same linearization
+/// point. Callers can therefore reject a delayed writer instead of replacing
+/// a newer index generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum VectorMutationConsistency {
+    /// Partition replacement is atomic, but independently prepared writers are
+    /// not ordered against one another.
+    #[default]
+    PartitionAtomic,
+    /// Partition mutations can be conditioned on the global index revision.
+    IndexRevisionCas,
+}
+
 /// Current logical size and published revision of an index.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -268,6 +286,11 @@ pub enum VectorIndexError {
         partition: String,
         id: String,
     },
+    ConditionalMutationUnsupported,
+    RevisionConflict {
+        expected: VectorRevision,
+        actual: VectorRevision,
+    },
     RevisionExhausted,
     WorkerFailed(String),
 }
@@ -327,6 +350,15 @@ impl fmt::Display for VectorIndexError {
             Self::ScoreOverflow { partition, id } => write!(
                 formatter,
                 "vector score overflowed for record '{id}' in partition '{partition}'"
+            ),
+            Self::ConditionalMutationUnsupported => {
+                formatter.write_str("vector index does not support conditional partition mutation")
+            }
+            Self::RevisionConflict { expected, actual } => write!(
+                formatter,
+                "vector index revision conflict: expected {}, actual {}",
+                expected.value(),
+                actual.value()
             ),
             Self::RevisionExhausted => formatter.write_str("vector index revision exhausted"),
             Self::WorkerFailed(message) => write!(formatter, "vector worker failed: {message}"),

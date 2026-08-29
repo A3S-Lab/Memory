@@ -25,8 +25,9 @@ pub mod vector;
 
 pub use vector::{
     InMemoryVectorIndex, VectorBudgetResource, VectorIndex, VectorIndexDescriptor,
-    VectorIndexError, VectorIndexStatus, VectorMetric, VectorNormalization, VectorRecord,
-    VectorResult, VectorRevision, VectorSearchHit, VectorSearchRequest, VectorSearchResult,
+    VectorIndexError, VectorIndexStatus, VectorMetric, VectorMutationConsistency,
+    VectorNormalization, VectorRecord, VectorResult, VectorRevision, VectorSearchHit,
+    VectorSearchRequest, VectorSearchResult,
 };
 
 /// SQLite-backed memory store with dual-track Markdown export.

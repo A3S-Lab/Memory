@@ -15,6 +15,6 @@ pub use in_memory::InMemoryVectorIndex;
 pub use index::VectorIndex;
 pub use types::{
     VectorBudgetResource, VectorIndexDescriptor, VectorIndexError, VectorIndexStatus, VectorMetric,
-    VectorNormalization, VectorRecord, VectorResult, VectorRevision, VectorSearchHit,
-    VectorSearchRequest, VectorSearchResult,
+    VectorMutationConsistency, VectorNormalization, VectorRecord, VectorResult, VectorRevision,
+    VectorSearchHit, VectorSearchRequest, VectorSearchResult,
 };

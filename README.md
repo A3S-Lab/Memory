@@ -133,7 +133,7 @@ released when its final owner is dropped.
 ```rust
 use a3s_memory::{
     InMemoryVectorIndex, VectorIndex, VectorIndexDescriptor, VectorRecord,
-    VectorSearchRequest,
+    VectorRevision, VectorSearchRequest,
 };
 
 let index = InMemoryVectorIndex::new(
@@ -143,8 +143,9 @@ let index = InMemoryVectorIndex::new(
 )?;
 
 index
-    .replace_partition(
+    .replace_partition_if_revision(
         "src/lib.rs",
+        VectorRevision::new(0),
         vec![VectorRecord::new("src/lib.rs:1-20", vec![0.8, 0.1, 0.2])
             .with_label("language", "rust")],
     )
@@ -162,7 +163,15 @@ Dimensions are selected at index construction. Cosine indexes normalize
 records and queries on admission, reject zero/non-finite vectors, and return
 the immutable index revision that produced each result page. Replacing one
 partition atomically publishes its complete new record set while sharing all
-unchanged partition blocks.
+unchanged partition blocks. `InMemoryVectorIndex` additionally advertises
+`index_revision_cas`: conditional replacement and removal compare the expected
+global index revision at the same linearization point as publication. A delayed
+writer therefore fails with `RevisionConflict` instead of overwriting or
+deleting a newer generation. Custom backends remain source-compatible and
+default to `partition_atomic`; their conditional methods fail closed until the
+backend implements the CAS contract. Because the precondition is the global
+index revision, an unrelated partition mutation can conservatively reject a
+prepared update.
 
 Run the locked release qualification for 25,000 records at 384 dimensions with
 `cargo run --example vector_search_benchmark --release`. It emits JSON evidence

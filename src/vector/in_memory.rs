@@ -1,8 +1,8 @@
 use super::search::search_snapshot;
 use super::{
     VectorBudgetResource, VectorIndex, VectorIndexDescriptor, VectorIndexError, VectorIndexStatus,
-    VectorNormalization, VectorRecord, VectorResult, VectorRevision, VectorSearchRequest,
-    VectorSearchResult,
+    VectorMutationConsistency, VectorNormalization, VectorRecord, VectorResult, VectorRevision,
+    VectorSearchRequest, VectorSearchResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -87,6 +87,10 @@ impl VectorIndex for InMemoryVectorIndex {
         self.snapshot().status()
     }
 
+    fn mutation_consistency(&self) -> VectorMutationConsistency {
+        VectorMutationConsistency::IndexRevisionCas
+    }
+
     async fn replace_partition(
         &self,
         partition: &str,
@@ -96,7 +100,22 @@ impl VectorIndex for InMemoryVectorIndex {
         let inner = Arc::clone(&self.inner);
         run_blocking(move || {
             let block = build_partition(&inner.descriptor, partition, records)?;
-            publish_partition(&inner, block)
+            publish_partition(&inner, block, None)
+        })
+        .await
+    }
+
+    async fn replace_partition_if_revision(
+        &self,
+        partition: &str,
+        expected_revision: VectorRevision,
+        records: Vec<VectorRecord>,
+    ) -> VectorResult<VectorIndexStatus> {
+        let partition = validate_partition(partition)?.to_string();
+        let inner = Arc::clone(&self.inner);
+        run_blocking(move || {
+            let block = build_partition(&inner.descriptor, partition, records)?;
+            publish_partition(&inner, block, Some(expected_revision))
         })
         .await
     }
@@ -104,7 +123,17 @@ impl VectorIndex for InMemoryVectorIndex {
     async fn remove_partition(&self, partition: &str) -> VectorResult<VectorIndexStatus> {
         let partition = validate_partition(partition)?.to_string();
         let inner = Arc::clone(&self.inner);
-        run_blocking(move || remove_partition(&inner, &partition)).await
+        run_blocking(move || remove_partition(&inner, &partition, None)).await
+    }
+
+    async fn remove_partition_if_revision(
+        &self,
+        partition: &str,
+        expected_revision: VectorRevision,
+    ) -> VectorResult<VectorIndexStatus> {
+        let partition = validate_partition(partition)?.to_string();
+        let inner = Arc::clone(&self.inner);
+        run_blocking(move || remove_partition(&inner, &partition, Some(expected_revision))).await
     }
 
     async fn search(&self, mut request: VectorSearchRequest) -> VectorResult<VectorSearchResult> {
@@ -331,9 +360,11 @@ fn normalize_unit(vector: &mut [f32]) {
 fn publish_partition(
     inner: &IndexInner,
     block: Arc<PartitionBlock>,
+    expected_revision: Option<VectorRevision>,
 ) -> VectorResult<VectorIndexStatus> {
     let mut published = write_unpoisoned(&inner.snapshot);
     let current = Arc::clone(&published);
+    verify_expected_revision(&current, expected_revision)?;
     let existing = current.partitions.get(&block.name);
 
     if block.record_count() == 0 && existing.is_none() {
@@ -377,9 +408,14 @@ fn publish_partition(
     Ok(status)
 }
 
-fn remove_partition(inner: &IndexInner, partition: &str) -> VectorResult<VectorIndexStatus> {
+fn remove_partition(
+    inner: &IndexInner,
+    partition: &str,
+    expected_revision: Option<VectorRevision>,
+) -> VectorResult<VectorIndexStatus> {
     let mut published = write_unpoisoned(&inner.snapshot);
     let current = Arc::clone(&published);
+    verify_expected_revision(&current, expected_revision)?;
     let Some(existing) = current.partitions.get(partition) else {
         return Ok(current.status());
     };
@@ -400,6 +436,21 @@ fn remove_partition(inner: &IndexInner, partition: &str) -> VectorResult<VectorI
     let status = next.status();
     *published = next;
     Ok(status)
+}
+
+fn verify_expected_revision(
+    current: &IndexSnapshot,
+    expected_revision: Option<VectorRevision>,
+) -> VectorResult<()> {
+    if let Some(expected) = expected_revision {
+        if current.revision != expected {
+            return Err(VectorIndexError::RevisionConflict {
+                expected,
+                actual: current.revision,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn clear_index(inner: &IndexInner) -> VectorResult<VectorIndexStatus> {
