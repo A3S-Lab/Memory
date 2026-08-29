@@ -97,6 +97,9 @@ retention state. Retrieval observation is split into explicit events:
 Candidate generation, retrieval, admission, and use therefore remain distinct
 and auditable. Each admission or use event names the exact node revision that
 was observed; the repository rejects references to revisions that do not exist.
+Admission accepts only the current `Active` revision, preventing a stale or
+concurrently superseded snapshot from entering a new model context. Use may
+still cite a historical revision for later audit.
 
 ### Bounded operations
 
@@ -242,7 +245,8 @@ The V2 kernel is not complete until tests prove:
 - stale revisions cannot partially apply;
 - correction and supersession preserve prior revisions;
 - query operations leave repository state unchanged;
-- admission and use events are independently idempotent;
+- admission and use events are independently idempotent, and stale/inactive
+  revisions cannot be newly admitted;
 - invalid and over-budget inputs leave state unchanged;
 - concurrent writers produce one valid serializable result;
 - persistent backends recover the last committed state after interruption.

@@ -535,6 +535,34 @@ async fn admission_and_use_events_are_independently_idempotent() {
         repository.record_use(conflict).await.unwrap_err(),
         MemoryRepositoryError::IdempotencyConflict { .. }
     ));
+
+    repository
+        .apply(changes(
+            ns.clone(),
+            "tombstone-one",
+            4,
+            vec![MemoryOperation::SetStatus {
+                node_id: "one".into(),
+                expected_revision: 1,
+                status: MemoryStatus::Tombstoned,
+            }],
+        ))
+        .await
+        .unwrap();
+    let historical = MemoryAccessEvent::new("event-3", ns.clone(), "one", 1, time(5));
+    assert!(matches!(
+        repository
+            .record_admission(historical.clone())
+            .await
+            .unwrap_err(),
+        MemoryRepositoryError::AdmissionNotAllowed { revision: 1, .. }
+    ));
+    repository.record_use(historical).await.unwrap();
+    assert_eq!(
+        repository.usage_summary(&ns, "one").await.unwrap().uses,
+        2,
+        "explicit use may cite a historical revision after it leaves active recall"
+    );
 }
 
 #[tokio::test]

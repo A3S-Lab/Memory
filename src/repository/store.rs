@@ -22,7 +22,7 @@ pub trait MemoryRepository: Send + Sync {
     /// Query one exact namespace without mutating repository state.
     async fn query(&self, query: MemoryQuery) -> Result<MemoryQueryResult, MemoryRepositoryError>;
 
-    /// Record that the host admitted a node into a model context.
+    /// Record that the host admitted the current active node revision into a model context.
     async fn record_admission(&self, event: MemoryAccessEvent)
         -> Result<(), MemoryRepositoryError>;
 

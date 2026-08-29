@@ -32,6 +32,12 @@ pub enum MemoryRepositoryError {
     EvidenceRequired {
         node_id: String,
     },
+    AdmissionNotAllowed {
+        node_id: String,
+        revision: u64,
+        current_revision: u64,
+        current_status: String,
+    },
     RevisionConflict {
         node_id: String,
         expected: u64,
@@ -101,6 +107,15 @@ impl fmt::Display for MemoryRepositoryError {
             Self::EvidenceRequired { node_id } => {
                 write!(formatter, "memory node {node_id} requires evidence")
             }
+            Self::AdmissionNotAllowed {
+                node_id,
+                revision,
+                current_revision,
+                current_status,
+            } => write!(
+                formatter,
+                "memory node {node_id} revision {revision} cannot be admitted; current revision {current_revision} is {current_status}"
+            ),
             Self::RevisionConflict {
                 node_id,
                 expected,

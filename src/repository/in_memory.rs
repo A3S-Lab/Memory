@@ -302,6 +302,16 @@ fn validate_access(
             node_id: event.node_id.clone(),
             revision: event.node_revision,
         })?;
+    if matches!(kind, AccessKind::Admission)
+        && (node.revision != event.node_revision || node.status != super::MemoryStatus::Active)
+    {
+        return Err(MemoryRepositoryError::AdmissionNotAllowed {
+            node_id: event.node_id.clone(),
+            revision: event.node_revision,
+            current_revision: node.revision,
+            current_status: node.status.as_str().into(),
+        });
+    }
     if event.occurred_at < revision_updated_at {
         return Err(MemoryRepositoryError::invalid(
             "accessEvent.occurredAt",
