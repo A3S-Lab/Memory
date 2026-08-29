@@ -1,0 +1,246 @@
+# A3S Memory Kernel V2
+
+Status: Accepted for implementation
+
+## Objective
+
+The memory kernel exists to improve future agent decisions without weakening
+correctness, isolation, auditability, or bounded execution. Storing more text is
+not a goal by itself.
+
+The first consumer is `a3s-code`, but the contract is runtime-neutral. The
+kernel must not depend on an LLM, an agent loop, a session implementation, or a
+transport.
+
+## Ownership
+
+`a3s-memory` owns the policy-free integrity boundary:
+
+- namespace validation and isolation;
+- typed memory nodes, evidence references, relations, and lifecycle states;
+- idempotent and revision-checked atomic changes;
+- pure reads and queries;
+- explicit admission and use records;
+- backend conformance and rebuildable derived indexes.
+
+The host runtime owns semantic policy:
+
+- deciding when to extract a candidate;
+- deciding whether evidence is explicit, verified, or inferred;
+- proposing activation, refinement, correction, or supersession;
+- generating embeddings and fusing retrieval branches;
+- admitting results into a model context;
+- scheduling consolidation and retention work;
+- exposing CLI, HTTP, MCP, or SDK surfaces.
+
+For `a3s-code`, immutable session, run, artifact, trace, and verification data
+remain the source evidence. The memory kernel stores typed references to that
+evidence rather than copying the complete session model.
+
+## Required Invariants
+
+### Namespace isolation
+
+Every node, relation, query, change set, and use record belongs to exactly one
+`MemoryNamespace`. A namespace contains opaque tenant, principal, and scope
+identifiers. Empty identifiers are invalid.
+
+Repository operations never infer or widen a namespace. Cross-namespace
+relations are invalid. A caller that is authorized to search more than one
+scope issues one explicit query per namespace and performs policy-aware fusion
+outside the repository.
+
+### Evidence before activation
+
+Every active derived node has at least one `EvidenceRef`. Evidence includes an
+opaque source URI, a content digest, an evidence kind, and the time at which the
+source event occurred.
+
+LLM confidence and importance values are annotations, not evidence. A runtime
+may create inferred material as `Candidate`, but only an explicit lifecycle
+change may make it `Active`.
+
+### Non-destructive evolution
+
+Consolidation never physically deletes history. Correction and supersession
+create a new revision and preserve prior content, evidence, and relationships.
+The active view hides superseded and tombstoned nodes by default.
+
+Physical purge is a separate administrative operation for explicit user or
+compliance deletion. It is not a consolidation action.
+
+### Deterministic replay
+
+Callers supply node IDs, change-set idempotency keys, source timestamps, and use
+event IDs. Reapplying an identical change set returns its original result.
+Reusing an idempotency key with different content fails.
+
+The repository does not call the wall clock or generate durable identities
+while applying a change set.
+
+### Optimistic concurrency
+
+Mutations carry an expected node revision. A stale expected revision fails the
+entire change set. Multi-node changes are atomic so a replacement node and the
+node it supersedes cannot be published independently.
+
+### Pure retrieval
+
+`get` and `query` do not update access counters, timestamps, relevance, or
+retention state. Retrieval observation is split into explicit events:
+
+- `record_admission`: the host admitted a node into model context;
+- `record_use`: the node was cited, selected, or otherwise used by the host.
+
+Candidate generation, retrieval, admission, and use therefore remain distinct
+and auditable.
+
+### Bounded operations
+
+Queries have validated finite limits. Change sets have a finite operation cap.
+Node content, evidence, relations, labels, and identifiers have explicit size
+limits. A backend must reject over-budget input before changing state.
+
+## Core Model
+
+The additive V2 API lives in a new `repository` module. The existing
+`MemoryItem` and `MemoryStore` API remains available during migration.
+
+### MemoryNamespace
+
+An exact security and ownership partition:
+
+- `tenant_id`
+- `principal_id`
+- `scope_id`
+
+The scope is opaque to the kernel. Examples include a user scope, a repository
+digest, or an agent-specific scope.
+
+### EvidenceRef
+
+A reference to immutable evidence:
+
+- `uri`
+- `digest`
+- `kind`: `UserStatement`, `ToolResult`, `Artifact`, `SessionTurn`,
+  `Verification`, or `Manual`
+- `occurred_at`
+
+The kernel validates shape and bounds but does not resolve the URI or verify the
+digest. That responsibility belongs to the authorized host.
+
+### MemoryNode
+
+A durable node contains:
+
+- caller-supplied ID and exact namespace;
+- `Episodic`, `Semantic`, or `Procedural` kind;
+- `Candidate`, `Active`, `Superseded`, `Conflicted`, or `Tombstoned` status;
+- content, confidence, importance, evidence, typed relations, and labels;
+- monotonically increasing revision;
+- caller-supplied creation and update timestamps.
+
+Working and short-term memory remain runtime state in `a3s-code`; they are not
+durable V2 node kinds.
+
+### MemoryRelation
+
+Relations are typed and validated, not comma-separated metadata:
+
+- `Supersedes`
+- `SupersededBy`
+- `ConflictsWith`
+- `RelatedTo`
+
+Targets must exist in the same namespace at commit time. Symmetric or inverse
+edges are represented explicitly in the same atomic change set.
+
+### MemoryChangeSet
+
+A change set contains an idempotency key, namespace, occurrence time, and a
+bounded sequence of operations. Initial operations are:
+
+- create a candidate or active node;
+- activate a candidate;
+- corroborate with new evidence;
+- refine or correct content with new evidence;
+- add or remove a relation;
+- change status to superseded, conflicted, or tombstoned.
+
+Each mutation names the expected revision. The repository validates all
+operations against a staged state and publishes either the complete result or
+nothing.
+
+### MemoryQuery
+
+A query is scoped to one exact namespace and can filter by text, kinds, and
+statuses. The default status filter is `Active`. Results contain immutable node
+snapshots plus retrieval score details. Queries are pure.
+
+The reference repository implements deterministic lexical matching. Vector
+retrieval remains caller-owned until an evaluation proves that it improves the
+target workload. The existing `VectorIndex` remains available independently.
+
+## Storage and Projection
+
+V2 defines behavior, not a mandatory physical representation.
+
+The in-memory implementation is the executable reference contract. Persistent
+backends follow after the conformance suite passes. SQLite, JSON files, keyword
+indexes, vector indexes, relation graphs, and Markdown are backend choices or
+derived projections.
+
+Markdown is not made authoritative in the first release. A deterministic
+human-readable projection may be rebuilt from repository state. Bidirectional
+editing requires a later design with revision preconditions and conflict
+resolution; append-only Markdown logs must not be presented as the current
+active state.
+
+## Compatibility
+
+V1 remains source-compatible while V2 is introduced:
+
+- existing `MemoryStore` implementations continue to compile;
+- existing `MemoryItem` serialization remains unchanged;
+- V2 uses new types rather than interpreting V1 string metadata as trusted
+  typed fields;
+- `a3s-code` moves to V2 behind an explicit option and initially runs in shadow
+  mode;
+- a migration tool may convert eligible V1 items into V2 candidates, but no V1
+  item becomes active without evidence and namespace assignment.
+
+V1 behavior that mutates access counters during reads remains unchanged for
+compatibility. V2 must not repeat that behavior.
+
+## Implementation Sequence
+
+1. Add the V2 types, validation errors, and repository trait.
+2. Write a reusable backend conformance suite before implementing storage.
+3. Implement the in-memory reference repository with atomic change sets.
+4. Add a persistent backend only after crash, replay, and concurrency contracts
+   are executable.
+5. Integrate `a3s-code` in candidate-only shadow mode with typed evidence.
+6. Enable active recall only after isolation, evidence, and quality gates pass.
+7. Add consolidation through an owned host or `a3s-flow` lifecycle.
+8. Evaluate lexical retrieval before adding vector fusion or graph expansion.
+9. Add human projections and proactive behavior last.
+
+## Release Gates
+
+The V2 kernel is not complete until tests prove:
+
+- zero cross-namespace reads, writes, deduplication, or relations;
+- every active derived node has evidence;
+- identical replay is idempotent and conflicting replay is rejected;
+- stale revisions cannot partially apply;
+- correction and supersession preserve prior revisions;
+- query operations leave repository state unchanged;
+- admission and use events are independently idempotent;
+- invalid and over-budget inputs leave state unchanged;
+- concurrent writers produce one valid serializable result;
+- persistent backends recover the last committed state after interruption.
+
+The product integration additionally requires an evaluation against no-memory
+and V1 baselines for write precision, evidence fidelity, conflict handling,
+task success, context tokens, latency, and model cost.
