@@ -23,6 +23,8 @@
 
 pub mod markdown;
 pub mod schema;
+#[cfg(feature = "sqlite-vec")]
+mod vector;
 
 use crate::{
     memories_are_store_duplicates, memory_is_prune_protected, merge_duplicate_memory_item,
@@ -66,18 +68,12 @@ impl SqliteMemoryStore {
 
         let db_path = base_dir.join("memory.db");
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
+            #[cfg(feature = "sqlite-vec")]
+            vector::register_auto_extension()?;
+
             let conn = Connection::open(&db_path)
                 .with_context(|| format!("Cannot open SQLite DB at {}", db_path.display()))?;
             schema::apply(&conn)?;
-
-            #[cfg(feature = "sqlite-vec")]
-            // SAFETY: transmute of a C function pointer to the expected auto-extension signature.
-            #[allow(clippy::missing_transmute_annotations)]
-            unsafe {
-                rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                    sqlite_vec::sqlite3_vec_init as *const (),
-                )));
-            }
 
             #[cfg(feature = "sqlite-vec")]
             conn.execute_batch(
@@ -166,71 +162,6 @@ impl SqliteMemoryStore {
         })
         .await
         .context("spawn_blocking panicked")?
-    }
-
-    /// Store an item together with a pre-computed embedding vector.
-    ///
-    /// Only available when the `sqlite-vec` Cargo feature is enabled.
-    #[cfg(feature = "sqlite-vec")]
-    pub async fn store_with_embedding(&self, item: MemoryItem, embedding: Vec<f32>) -> Result<()> {
-        // First store normally (FTS + Markdown)
-        let item = self.store_and_return(item).await?;
-
-        let id = item.id.clone();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let c = conn.lock().expect("sqlite lock poisoned");
-            let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-            c.execute(
-                "INSERT OR REPLACE INTO memories_vec (memory_id, embedding) VALUES (?1, ?2)",
-                params![id, blob],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("spawn_blocking panicked")?
-    }
-
-    /// Find the `limit` nearest neighbours to `query_embedding` by cosine
-    /// distance, returning their ids.
-    ///
-    /// Only available when the `sqlite-vec` Cargo feature is enabled.
-    #[cfg(feature = "sqlite-vec")]
-    pub async fn search_semantic(
-        &self,
-        query_embedding: Vec<f32>,
-        limit: usize,
-    ) -> Result<Vec<MemoryItem>> {
-        let conn = self.conn.clone();
-        let blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        let ids: Vec<String> = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let c = conn.lock().expect("sqlite lock poisoned");
-            let mut stmt = c.prepare(
-                "SELECT memory_id
-                 FROM memories_vec
-                 WHERE embedding MATCH ?1
-                 ORDER BY distance
-                 LIMIT ?2",
-            )?;
-            let ids = stmt
-                .query_map(params![blob, limit as i64], |row| row.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(ids)
-        })
-        .await
-        .context("spawn_blocking panicked")??;
-
-        let mut items = Vec::with_capacity(ids.len());
-        for id in &ids {
-            if let Some(item) = self.retrieve(id).await? {
-                items.push(item);
-            }
-        }
-        Ok(items)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────

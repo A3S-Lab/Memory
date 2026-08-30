@@ -260,6 +260,8 @@ advancement, namespace isolation, idempotent and failed writes, access-event
 stability, concurrent single-winner updates, restart reconstruction, tamper
 rejection, redaction, and source-compatible custom-backend opt-in.
 Enabling the `sqlite` feature also runs the SQLite V1 backend contract.
+The `sqlite-vec` gate separately proves that concurrent first connections
+register the `vec0` auto-extension before either SQLite connection is opened.
 
 ```sh
 cargo test
