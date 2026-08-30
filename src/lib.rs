@@ -17,7 +17,7 @@
 /// backwards compatibility.
 pub mod repository;
 
-/// Ephemeral vector indexes for caller-owned semantic retrieval.
+/// Vector indexes for caller-owned semantic retrieval.
 ///
 /// This capability is independent from [`MemoryStore`]: callers own document
 /// admission, embedding generation, lifecycle, and result fusion.
@@ -25,10 +25,13 @@ pub mod vector;
 
 pub use vector::{
     InMemoryVectorIndex, VectorBudgetResource, VectorIndex, VectorIndexDescriptor,
-    VectorIndexError, VectorIndexStatus, VectorMetric, VectorMutationConsistency,
-    VectorNormalization, VectorRecord, VectorResult, VectorRevision, VectorSearchHit,
-    VectorSearchRequest, VectorSearchResult,
+    VectorIndexError, VectorIndexObservation, VectorIndexStatus, VectorMetric,
+    VectorMutationConsistency, VectorNormalization, VectorRecord, VectorResult, VectorRevision,
+    VectorSearchHit, VectorSearchRequest, VectorSearchResult,
 };
+
+#[cfg(feature = "sqlite")]
+pub use vector::SqliteVectorIndex;
 
 /// SQLite-backed memory store with dual-track Markdown export.
 ///

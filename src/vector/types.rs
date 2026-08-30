@@ -261,6 +261,34 @@ pub struct VectorIndexStatus {
     pub byte_count: usize,
 }
 
+/// One self-consistent observation of a vector index revision.
+///
+/// A change token, when present, must identify the same revision as `status`.
+/// Correctness-sensitive callers should prefer [`VectorIndex::observe`](super::VectorIndex::observe)
+/// over composing the synchronous compatibility accessors themselves.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VectorIndexObservation {
+    pub status: VectorIndexStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_token: Option<VectorIndexChangeToken>,
+}
+
+impl VectorIndexObservation {
+    /// Verify that all evidence names one valid index revision.
+    pub fn verify(&self) -> VectorResult<()> {
+        if let Some(token) = &self.change_token {
+            token.verify()?;
+            if token.revision() != self.status.revision {
+                return Err(VectorIndexError::InvalidObservation(
+                    "change token and status revisions differ".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A bounded exact-vector query.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -330,6 +358,7 @@ pub enum VectorIndexError {
     InvalidDescriptor(String),
     InvalidRequest(String),
     InvalidChangeToken(String),
+    InvalidObservation(String),
     InvalidPartition,
     InvalidRecordId {
         partition: String,
@@ -370,6 +399,9 @@ pub enum VectorIndexError {
         actual: VectorRevision,
     },
     RevisionExhausted,
+    DescriptorMismatch,
+    StorageCorrupted(String),
+    StorageFailed(String),
     WorkerFailed(String),
 }
 
@@ -382,6 +414,9 @@ impl fmt::Display for VectorIndexError {
             Self::InvalidRequest(message) => write!(formatter, "invalid vector search: {message}"),
             Self::InvalidChangeToken(message) => {
                 write!(formatter, "invalid vector index change token: {message}")
+            }
+            Self::InvalidObservation(message) => {
+                write!(formatter, "invalid vector index observation: {message}")
             }
             Self::InvalidPartition => formatter.write_str("vector partition must not be empty"),
             Self::InvalidRecordId {
@@ -442,6 +477,18 @@ impl fmt::Display for VectorIndexError {
                 actual.value()
             ),
             Self::RevisionExhausted => formatter.write_str("vector index revision exhausted"),
+            Self::DescriptorMismatch => {
+                formatter.write_str("vector index descriptor does not match durable storage")
+            }
+            Self::StorageCorrupted(message) => {
+                write!(formatter, "vector index storage is corrupted: {message}")
+            }
+            Self::StorageFailed(message) => {
+                write!(
+                    formatter,
+                    "vector index storage operation failed: {message}"
+                )
+            }
             Self::WorkerFailed(message) => write!(formatter, "vector worker failed: {message}"),
         }
     }

@@ -55,6 +55,9 @@ async fn custom_backend_defaults_remain_source_compatible_and_fail_closed_for_ca
         index.mutation_consistency(),
         VectorMutationConsistency::PartitionAtomic
     );
+    let observation = index.observe().await.unwrap();
+    assert_eq!(observation.status, VectorIndexStatus::default());
+    assert!(observation.change_token.is_none());
 
     let error = index
         .replace_partition_if_revision(

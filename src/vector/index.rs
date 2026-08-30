@@ -1,7 +1,7 @@
 use super::{
-    VectorIndexChangeToken, VectorIndexDescriptor, VectorIndexError, VectorIndexStatus,
-    VectorMutationConsistency, VectorRecord, VectorResult, VectorRevision, VectorSearchRequest,
-    VectorSearchResult,
+    VectorIndexChangeToken, VectorIndexDescriptor, VectorIndexError, VectorIndexObservation,
+    VectorIndexStatus, VectorMutationConsistency, VectorRecord, VectorResult, VectorRevision,
+    VectorSearchRequest, VectorSearchResult,
 };
 
 /// A bounded vector index whose content and lifecycle are owned by its caller.
@@ -14,7 +14,10 @@ pub trait VectorIndex: Send + Sync {
     /// Return the immutable shape and resource limits of this index.
     fn descriptor(&self) -> &VectorIndexDescriptor;
 
-    /// Return the latest published status without waiting for background work.
+    /// Return the latest locally observed status without waiting for I/O.
+    ///
+    /// This compatibility accessor can be stale for durable or remote
+    /// backends. Use [`Self::observe`] when the result guards correctness.
     fn status(&self) -> VectorIndexStatus;
 
     /// Return exact evidence for the current revision of one index history.
@@ -25,6 +28,20 @@ pub trait VectorIndex: Send + Sync {
     /// is independently recreated or restored onto a divergent history.
     fn change_token(&self) -> Option<VectorIndexChangeToken> {
         None
+    }
+
+    /// Observe one self-consistent published revision.
+    ///
+    /// The conservative default exposes only the status compatibility view.
+    /// Backends must override this method to expose an exact history token;
+    /// doing so asserts that the status and token were read atomically.
+    async fn observe(&self) -> VectorResult<VectorIndexObservation> {
+        let observation = VectorIndexObservation {
+            status: self.status(),
+            change_token: None,
+        };
+        observation.verify()?;
+        Ok(observation)
     }
 
     /// Return the strongest partition-mutation ordering contract implemented

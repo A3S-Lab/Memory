@@ -12,7 +12,7 @@ name = "a3s_memory"
 path = "src/lib.rs"
 
 [features]
-# SQLite-backed store with FTS5 full-text search
+# SQLite-backed memory store and durable vector index
 sqlite = ["dep:rusqlite"]
 # Vector-similarity search via sqlite-vec (requires sqlite feature)
 sqlite-vec = ["sqlite", "dep:sqlite-vec"]

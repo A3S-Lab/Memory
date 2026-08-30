@@ -4,10 +4,11 @@ Pluggable memory storage for A3S.
 
 Provides the `MemoryStore` trait and two default implementations. Agents that need to persist and recall knowledge across sessions depend on this crate directly — nothing else required.
 
-The crate also provides a separate, dependency-free `VectorIndex` capability
-for caller-owned ephemeral semantic retrieval. Vector indexes are not memory
-stores: callers remain responsible for document admission, embedding
-generation, lifecycle, and result fusion.
+The crate also provides a separate `VectorIndex` capability for caller-owned
+semantic retrieval. Its in-memory backend is dependency-free; the optional
+SQLite backend preserves index history and revision CAS across process
+restarts. Vector indexes are not memory stores: callers remain responsible for
+document admission, embedding generation, lifecycle, and result fusion.
 
 Default stores also enforce a small amount of memory hygiene: normalized exact
 duplicates are merged into the existing item, tags/metadata/importance are
@@ -135,7 +136,7 @@ impl MemoryStore for MyStore {
 }
 ```
 
-### Ephemeral vector search
+### Caller-owned vector search
 
 `InMemoryVectorIndex` stores caller-supplied vectors in immutable partition
 snapshots and performs exact bounded top-k search. It does not use SQLite,
@@ -195,6 +196,33 @@ durable backend may preserve a history digest across process restarts only
 while it can prove the same linear mutation history; recreation, rollback, or
 divergent restore requires a new identity. The token is not a content snapshot,
 distributed lease, or remote-durability claim.
+
+Correctness-sensitive callers should use the asynchronous
+`VectorIndex::observe()` method. It returns one self-consistent status/token
+pair and can report storage failures. The synchronous `status()` and
+`change_token()` methods remain compatibility views and can be stale for a
+durable or remote implementation.
+
+With the `sqlite` feature, `SqliteVectorIndex::open(path, descriptor)` adds a
+locally durable exact-search backend. It stores the descriptor, opaque history
+identity, revision, stable logical byte accounting, partition integrity
+digests, and vector rows in one SQLite database. Mutations use `IMMEDIATE`
+transactions, so independent processes share one global revision-CAS
+linearization point. Reopen validates the descriptor, accounting, record
+shape, and integrity digests before serving; mismatches and corruption fail
+closed. Blocking SQLite work runs on Tokio's blocking pool. This is local
+durability and fencing, not a distributed lease or remote replicated store.
+
+```rust
+use a3s_memory::{SqliteVectorIndex, VectorIndex, VectorIndexDescriptor};
+
+let index = SqliteVectorIndex::open(
+    "/var/lib/agent/semantic.sqlite3",
+    VectorIndexDescriptor::new(384),
+)
+.await?;
+let observation = index.observe().await?;
+```
 
 Run the locked release qualification for 25,000 records at 384 dimensions with
 `cargo run --example vector_search_benchmark --release`. It emits JSON evidence
@@ -270,10 +298,13 @@ The optional namespace change-token suite additionally covers atomic
 advancement, namespace isolation, idempotent and failed writes, access-event
 stability, concurrent single-winner updates, restart reconstruction, tamper
 rejection, redaction, and source-compatible custom-backend opt-in.
-The vector change-token suite proves clone continuity, effective-mutation
-advancement, no-op stability, serialization validation, and distinct histories
-for independently constructed indexes with colliding logical status.
-Enabling the `sqlite` feature also runs the SQLite V1 backend contract.
+The vector suites prove atomic observation, clone continuity,
+effective-mutation advancement, no-op stability, serialization validation, and
+distinct histories for independently constructed indexes with colliding
+logical status. Enabling the `sqlite` feature additionally proves restart
+continuity, cross-connection single-winner CAS, stable cross-backend byte
+accounting, descriptor-drift rejection, content-integrity checks, and
+fail-closed corruption handling, as well as the SQLite V1 store contract.
 The `sqlite-vec` gate separately proves that concurrent first connections
 register the `vec0` auto-extension before either SQLite connection is opened.
 

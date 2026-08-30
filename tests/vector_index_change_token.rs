@@ -1,6 +1,6 @@
 use a3s_memory::vector::{
-    InMemoryVectorIndex, VectorIndex, VectorIndexChangeToken, VectorIndexDescriptor, VectorRecord,
-    VectorRevision, VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1,
+    InMemoryVectorIndex, VectorIndex, VectorIndexChangeToken, VectorIndexDescriptor,
+    VectorIndexObservation, VectorRecord, VectorRevision, VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1,
 };
 
 fn record(id: &str, embedding: [f32; 2]) -> VectorRecord {
@@ -11,10 +11,15 @@ fn record(id: &str, embedding: [f32; 2]) -> VectorRecord {
 async fn in_memory_change_tokens_bind_one_index_history_and_exact_revision() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<VectorIndexChangeToken>();
+    assert_send_sync::<VectorIndexObservation>();
 
     let first = InMemoryVectorIndex::new(VectorIndexDescriptor::new(2)).unwrap();
     let first_clone = first.clone();
     let initial = first.change_token().expect("built-in change token");
+    let initial_observation = first.observe().await.unwrap();
+    initial_observation.verify().unwrap();
+    assert_eq!(initial_observation.status, first.status());
+    assert_eq!(initial_observation.change_token, Some(initial.clone()));
     initial.verify().unwrap();
     assert_eq!(initial.profile(), VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1);
     assert_eq!(initial.revision(), VectorRevision::new(0));
@@ -32,6 +37,9 @@ async fn in_memory_change_tokens_bind_one_index_history_and_exact_revision() {
         .await
         .unwrap();
     let published = first.change_token().expect("published token");
+    let published_observation = first.observe().await.unwrap();
+    assert_eq!(published_observation.status, first.status());
+    assert_eq!(published_observation.change_token, Some(published.clone()));
     assert_eq!(published.history_digest(), initial.history_digest());
     assert_eq!(published.revision(), VectorRevision::new(1));
     assert_ne!(published, initial);
@@ -53,6 +61,24 @@ async fn in_memory_change_tokens_bind_one_index_history_and_exact_revision() {
     assert_eq!(unrelated_token.revision(), published.revision());
     assert_ne!(unrelated_token.history_digest(), published.history_digest());
     assert_ne!(unrelated_token, published);
+}
+
+#[test]
+fn observations_reject_tokens_from_a_different_revision() {
+    let token = VectorIndexChangeToken::try_new(
+        format!("sha256:{}", "b".repeat(64)),
+        VectorRevision::new(3),
+    )
+    .unwrap();
+    let observation = VectorIndexObservation {
+        status: a3s_memory::vector::VectorIndexStatus {
+            revision: VectorRevision::new(4),
+            ..Default::default()
+        },
+        change_token: Some(token),
+    };
+
+    assert!(observation.verify().is_err());
 }
 
 #[test]

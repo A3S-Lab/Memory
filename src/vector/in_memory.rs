@@ -1,8 +1,9 @@
 use super::search::search_snapshot;
 use super::{
     VectorBudgetResource, VectorIndex, VectorIndexChangeToken, VectorIndexDescriptor,
-    VectorIndexError, VectorIndexStatus, VectorMutationConsistency, VectorNormalization,
-    VectorRecord, VectorResult, VectorRevision, VectorSearchRequest, VectorSearchResult,
+    VectorIndexError, VectorIndexObservation, VectorIndexStatus, VectorMutationConsistency,
+    VectorNormalization, VectorRecord, VectorResult, VectorRevision, VectorSearchRequest,
+    VectorSearchResult,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,10 +35,10 @@ struct IndexInner {
 
 #[derive(Default)]
 pub(super) struct IndexSnapshot {
-    revision: VectorRevision,
+    pub(super) revision: VectorRevision,
     pub(super) partitions: BTreeMap<String, Arc<PartitionBlock>>,
-    record_count: usize,
-    byte_count: usize,
+    pub(super) record_count: usize,
+    pub(super) byte_count: usize,
 }
 
 pub(super) struct PartitionBlock {
@@ -45,7 +46,7 @@ pub(super) struct PartitionBlock {
     pub(super) ids: Vec<String>,
     pub(super) labels: Vec<BTreeMap<String, String>>,
     pub(super) vectors: Vec<f32>,
-    byte_count: usize,
+    pub(super) byte_count: usize,
 }
 
 impl PartitionBlock {
@@ -84,7 +85,7 @@ impl InMemoryVectorIndex {
     }
 }
 
-fn new_history_digest() -> String {
+pub(super) fn new_history_digest() -> String {
     let mut hasher = Sha256::new();
     hasher.update(HISTORY_DIGEST_DOMAIN.as_bytes());
     hasher.update([0]);
@@ -109,6 +110,20 @@ impl VectorIndex for InMemoryVectorIndex {
                 .initial_change_token
                 .with_revision(snapshot.revision),
         )
+    }
+
+    async fn observe(&self) -> VectorResult<VectorIndexObservation> {
+        let snapshot = self.snapshot();
+        let observation = VectorIndexObservation {
+            status: snapshot.status(),
+            change_token: Some(
+                self.inner
+                    .initial_change_token
+                    .with_revision(snapshot.revision),
+            ),
+        };
+        observation.verify()?;
+        Ok(observation)
     }
 
     fn mutation_consistency(&self) -> VectorMutationConsistency {
@@ -193,7 +208,7 @@ where
         .map_err(|error| VectorIndexError::WorkerFailed(error.to_string()))?
 }
 
-fn validate_partition(partition: &str) -> VectorResult<&str> {
+pub(super) fn validate_partition(partition: &str) -> VectorResult<&str> {
     let partition = partition.trim();
     if partition.is_empty() {
         Err(VectorIndexError::InvalidPartition)
@@ -202,7 +217,7 @@ fn validate_partition(partition: &str) -> VectorResult<&str> {
     }
 }
 
-fn validate_request_filters(request: &VectorSearchRequest) -> VectorResult<()> {
+pub(super) fn validate_request_filters(request: &VectorSearchRequest) -> VectorResult<()> {
     if request
         .partitions
         .iter()
@@ -218,7 +233,7 @@ fn validate_request_filters(request: &VectorSearchRequest) -> VectorResult<()> {
     Ok(())
 }
 
-fn build_partition(
+pub(super) fn build_partition(
     descriptor: &VectorIndexDescriptor,
     name: String,
     records: Vec<VectorRecord>,
@@ -243,9 +258,7 @@ fn build_partition(
         });
     }
     let mut seen = BTreeSet::new();
-    let mut byte_count = std::mem::size_of::<PartitionBlock>()
-        .checked_add(name.len())
-        .ok_or(VectorIndexError::SizeOverflow)?;
+    let mut byte_count = name.len();
 
     for (record_index, record) in records.iter().enumerate() {
         if record.id.trim().is_empty() {
@@ -318,15 +331,13 @@ fn accounted_record_bytes(
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or(VectorIndexError::SizeOverflow)?;
     current
-        .checked_add(std::mem::size_of::<String>())
-        .and_then(|value| value.checked_add(std::mem::size_of::<BTreeMap<String, String>>()))
-        .and_then(|value| value.checked_add(id.len()))
+        .checked_add(id.len())
         .and_then(|value| value.checked_add(label_bytes))
         .and_then(|value| value.checked_add(vector_bytes))
         .ok_or(VectorIndexError::SizeOverflow)
 }
 
-fn prepare_vector(
+pub(super) fn prepare_vector(
     mut vector: Vec<f32>,
     descriptor: &VectorIndexDescriptor,
     context: String,
@@ -492,7 +503,7 @@ fn clear_index(inner: &IndexInner) -> VectorResult<VectorIndexStatus> {
     Ok(status)
 }
 
-fn enforce_budgets(
+pub(super) fn enforce_budgets(
     descriptor: &VectorIndexDescriptor,
     record_count: usize,
     byte_count: usize,

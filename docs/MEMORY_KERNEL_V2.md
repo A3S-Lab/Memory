@@ -136,11 +136,14 @@ partially replaced partition. `index_revision_cas` additionally compares an
 expected global index revision and publishes replacement or removal at the same
 linearization point. This prevents delayed derived-index writers and cleanup
 tasks from overwriting a newer generation when every writer uses the
-conditional API. The in-memory reference index implements this contract;
-custom backends default to source-compatible atomic replacement and reject
-conditional mutation until they implement it. CAS is intentionally global and
-may reject on unrelated partition churn. It is not a distributed lease, a
-durable remote backend, or permission to treat vectors as authoritative.
+conditional API. The in-memory reference index implements this contract. The
+optional `SqliteVectorIndex` preserves the same global CAS and history identity
+across local process restarts, with SQLite transactions as the linearization
+point. Custom backends default to source-compatible atomic replacement and
+reject conditional mutation until they implement it. CAS is intentionally
+global and may reject on unrelated partition churn. The SQLite backend is not
+a distributed lease, a durable remote backend, or permission to treat vectors
+as authoritative.
 
 `VectorIndex::change_token` is a separate optional continuity proof. A `Some`
 token binds one canonical opaque SHA-256 index-history digest to the exact
@@ -149,11 +152,20 @@ Every effective content mutation must advance that revision, while independent
 construction, divergent restore, or rollback must use a different history
 digest. This closes the ambiguity where two unrelated indexes can expose the
 same revision, record count, and byte count while containing different vectors.
-The in-memory index keeps one digest across clones and assigns a new digest
-at construction. Custom backends return `None`; a durable backend may retain an
-digest across process restarts only when its storage protocol preserves the
-same linear history. The token is content-free and is not a vector snapshot,
-lease, fencing authority, or durability proof by itself.
+The in-memory index keeps one digest across clones and assigns a new digest at
+construction. The SQLite index persists one digest alongside the descriptor
+and advances its revision in the same transaction as content. Custom backends
+return `None`; another durable backend may retain a digest across process
+restarts only when its storage protocol preserves the same linear history. The
+token is content-free and is not a vector snapshot, lease, fencing authority,
+or durability proof by itself.
+
+`VectorIndex::observe` is the correctness API for reading status and optional
+history evidence together. Built-in backends return one exact observation;
+the source-compatible default returns only the synchronous status view and no
+history token. Durable and remote implementations may perform I/O and fail.
+The synchronous `status` and `change_token` methods are compatibility hints and
+must not guard durable recovery or publication decisions.
 
 ### Bounded operations
 
@@ -275,7 +287,8 @@ V1 remains source-compatible while V2 is introduced:
 
 - existing `MemoryStore` implementations continue to compile;
 - existing `MemoryRepository` implementations default to no change token;
-- existing `VectorIndex` implementations default to no change token;
+- existing `VectorIndex` implementations default to a status-only observation
+  and no change token;
 - existing `MemoryItem` serialization remains unchanged;
 - V2 uses new types rather than interpreting V1 string metadata as trusted
   typed fields;
@@ -320,6 +333,10 @@ The V2 kernel is not complete until tests prove:
   advance on effective mutation, remain stable on no-op mutation, reject
   malformed serialized evidence, and differ across independent indexes even
   when their logical status collides;
+- SQLite vector indexes retain exact history and revisions across reopen,
+  serialize independent-connection CAS to one winner, use stable logical byte
+  accounting, and reject descriptor drift, accounting corruption, and content
+  digest mismatch before serving;
 - the shared in-memory/file contract retrieves partial CJK phrases under the
   exact versioned lexical profile without adding single-character matching;
 - admission and use events are independently idempotent, and stale/inactive
