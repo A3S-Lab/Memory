@@ -4,8 +4,11 @@ use super::{
     VectorIndexError, VectorIndexStatus, VectorMutationConsistency, VectorNormalization,
     VectorRecord, VectorResult, VectorRevision, VectorSearchRequest, VectorSearchResult,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+const HISTORY_DIGEST_DOMAIN: &str = "a3s.memory.vector-index-history.v1";
 
 /// Exact, session-ephemeral vector index backed by immutable partition blocks.
 #[derive(Clone)]
@@ -65,10 +68,8 @@ impl IndexSnapshot {
 impl InMemoryVectorIndex {
     pub fn new(descriptor: VectorIndexDescriptor) -> VectorResult<Self> {
         descriptor.validate()?;
-        let initial_change_token = VectorIndexChangeToken::try_new(
-            uuid::Uuid::new_v4().to_string(),
-            VectorRevision::default(),
-        )?;
+        let initial_change_token =
+            VectorIndexChangeToken::try_new(new_history_digest(), VectorRevision::default())?;
         Ok(Self {
             inner: Arc::new(IndexInner {
                 descriptor,
@@ -81,6 +82,14 @@ impl InMemoryVectorIndex {
     fn snapshot(&self) -> Arc<IndexSnapshot> {
         read_unpoisoned(&self.inner.snapshot).clone()
     }
+}
+
+fn new_history_digest() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(HISTORY_DIGEST_DOMAIN.as_bytes());
+    hasher.update([0]);
+    hasher.update(uuid::Uuid::new_v4().as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 #[async_trait::async_trait]

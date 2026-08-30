@@ -158,8 +158,6 @@ impl VectorRevision {
 /// Stable profile for exact vector-index history tokens.
 pub const VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1: &str = "a3s.memory.vector-index-change-token.v1";
 
-const MAX_VECTOR_INDEX_HISTORY_ID_BYTES: usize = 256;
-
 /// Exact revision evidence scoped to one vector-index history.
 ///
 /// A durable backend must retain the same history identity only while it can
@@ -171,16 +169,19 @@ const MAX_VECTOR_INDEX_HISTORY_ID_BYTES: usize = 256;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VectorIndexChangeToken {
     profile: String,
-    history_id: String,
+    history_digest: String,
     revision: VectorRevision,
 }
 
 impl VectorIndexChangeToken {
     /// Construct a token for a caller-owned index history.
-    pub fn try_new(history_id: impl Into<String>, revision: VectorRevision) -> VectorResult<Self> {
+    pub fn try_new(
+        history_digest: impl Into<String>,
+        revision: VectorRevision,
+    ) -> VectorResult<Self> {
         let token = Self {
             profile: VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1.to_string(),
-            history_id: history_id.into(),
+            history_digest: history_digest.into(),
             revision,
         };
         token.verify()?;
@@ -191,8 +192,8 @@ impl VectorIndexChangeToken {
         &self.profile
     }
 
-    pub fn history_id(&self) -> &str {
-        &self.history_id
+    pub fn history_digest(&self) -> &str {
+        &self.history_digest
     }
 
     pub fn revision(&self) -> VectorRevision {
@@ -206,17 +207,10 @@ impl VectorIndexChangeToken {
                 "profile is unsupported".to_string(),
             ));
         }
-        if self.history_id.is_empty()
-            || self.history_id.len() > MAX_VECTOR_INDEX_HISTORY_ID_BYTES
-            || self.history_id.trim() != self.history_id
-            || !self
-                .history_id
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || ".:_-".contains(character))
-        {
-            return Err(VectorIndexError::InvalidChangeToken(format!(
-                "history_id must contain 1 to {MAX_VECTOR_INDEX_HISTORY_ID_BYTES} ASCII identity characters"
-            )));
+        if !valid_sha256(&self.history_digest) {
+            return Err(VectorIndexError::InvalidChangeToken(
+                "history_digest must be canonical lowercase SHA-256".to_string(),
+            ));
         }
         Ok(())
     }
@@ -227,6 +221,15 @@ impl VectorIndexChangeToken {
             ..self.clone()
         }
     }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 /// Strongest mutation ordering contract exposed by one vector backend.

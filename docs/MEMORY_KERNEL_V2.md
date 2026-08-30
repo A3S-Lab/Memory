@@ -143,14 +143,15 @@ may reject on unrelated partition churn. It is not a distributed lease, a
 durable remote backend, or permission to treat vectors as authoritative.
 
 `VectorIndex::change_token` is a separate optional continuity proof. A `Some`
-token binds one opaque index-history identity to the exact global revision.
+token binds one canonical opaque SHA-256 index-history digest to the exact
+global revision.
 Every effective content mutation must advance that revision, while independent
 construction, divergent restore, or rollback must use a different history
-identity. This closes the ambiguity where two unrelated indexes can expose the
+digest. This closes the ambiguity where two unrelated indexes can expose the
 same revision, record count, and byte count while containing different vectors.
-The in-memory index keeps one identity across clones and assigns a new identity
+The in-memory index keeps one digest across clones and assigns a new digest
 at construction. Custom backends return `None`; a durable backend may retain an
-identity across process restarts only when its storage protocol preserves the
+digest across process restarts only when its storage protocol preserves the
 same linear history. The token is content-free and is not a vector snapshot,
 lease, fencing authority, or durability proof by itself.
 

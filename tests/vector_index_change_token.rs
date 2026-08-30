@@ -32,7 +32,7 @@ async fn in_memory_change_tokens_bind_one_index_history_and_exact_revision() {
         .await
         .unwrap();
     let published = first.change_token().expect("published token");
-    assert_eq!(published.history_id(), initial.history_id());
+    assert_eq!(published.history_digest(), initial.history_digest());
     assert_eq!(published.revision(), VectorRevision::new(1));
     assert_ne!(published, initial);
 
@@ -51,19 +51,26 @@ async fn in_memory_change_tokens_bind_one_index_history_and_exact_revision() {
     assert_eq!(unrelated.status(), first.status());
     let unrelated_token = unrelated.change_token().expect("unrelated token");
     assert_eq!(unrelated_token.revision(), published.revision());
-    assert_ne!(unrelated_token.history_id(), published.history_id());
+    assert_ne!(unrelated_token.history_digest(), published.history_digest());
     assert_ne!(unrelated_token, published);
 }
 
 #[test]
 fn custom_change_tokens_validate_bounded_history_identity_and_profile() {
-    let token = VectorIndexChangeToken::try_new("remote-cluster.index-17", VectorRevision::new(9))
-        .expect("valid custom history");
+    let token = VectorIndexChangeToken::try_new(
+        format!("sha256:{}", "a".repeat(64)),
+        VectorRevision::new(9),
+    )
+    .expect("valid custom history");
     token.verify().unwrap();
 
     assert!(VectorIndexChangeToken::try_new("", VectorRevision::new(1)).is_err());
-    assert!(VectorIndexChangeToken::try_new(" history", VectorRevision::new(1)).is_err());
-    assert!(VectorIndexChangeToken::try_new("history/unsafe", VectorRevision::new(1)).is_err());
+    assert!(VectorIndexChangeToken::try_new("sha256:short", VectorRevision::new(1)).is_err());
+    assert!(VectorIndexChangeToken::try_new(
+        format!("sha256:{}", "A".repeat(64)),
+        VectorRevision::new(1),
+    )
+    .is_err());
 
     let mut forged = serde_json::to_value(token).unwrap();
     forged["profile"] = serde_json::json!("a3s.memory.vector-index-change-token.v2");

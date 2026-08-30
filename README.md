@@ -187,11 +187,11 @@ prepared update.
 
 Backends may also expose `VectorIndex::change_token()` as exact continuity
 evidence for one index history and revision. `InMemoryVectorIndex` assigns a
-fresh opaque history identity when it is constructed; clones retain it and
+fresh opaque SHA-256 history digest when it is constructed; clones retain it and
 every effective mutation advances the token revision. Two independently
 constructed indexes therefore have different tokens even when their counters
 and byte sizes happen to match. Custom indexes return `None` by default. A
-durable backend may preserve a history identity across process restarts only
+durable backend may preserve a history digest across process restarts only
 while it can prove the same linear mutation history; recreation, rollback, or
 divergent restore requires a new identity. The token is not a content snapshot,
 distributed lease, or remote-durability claim.
