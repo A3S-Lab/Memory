@@ -185,6 +185,17 @@ backend implements the CAS contract. Because the precondition is the global
 index revision, an unrelated partition mutation can conservatively reject a
 prepared update.
 
+Backends may also expose `VectorIndex::change_token()` as exact continuity
+evidence for one index history and revision. `InMemoryVectorIndex` assigns a
+fresh opaque history identity when it is constructed; clones retain it and
+every effective mutation advances the token revision. Two independently
+constructed indexes therefore have different tokens even when their counters
+and byte sizes happen to match. Custom indexes return `None` by default. A
+durable backend may preserve a history identity across process restarts only
+while it can prove the same linear mutation history; recreation, rollback, or
+divergent restore requires a new identity. The token is not a content snapshot,
+distributed lease, or remote-durability claim.
+
 Run the locked release qualification for 25,000 records at 384 dimensions with
 `cargo run --example vector_search_benchmark --release`. It emits JSON evidence
 and fails when exact top-20 search exceeds the 30 ms p95 budget.
@@ -259,6 +270,9 @@ The optional namespace change-token suite additionally covers atomic
 advancement, namespace isolation, idempotent and failed writes, access-event
 stability, concurrent single-winner updates, restart reconstruction, tamper
 rejection, redaction, and source-compatible custom-backend opt-in.
+The vector change-token suite proves clone continuity, effective-mutation
+advancement, no-op stability, serialization validation, and distinct histories
+for independently constructed indexes with colliding logical status.
 Enabling the `sqlite` feature also runs the SQLite V1 backend contract.
 The `sqlite-vec` gate separately proves that concurrent first connections
 register the `vec0` auto-extension before either SQLite connection is opened.

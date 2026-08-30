@@ -1,6 +1,7 @@
 use super::{
-    VectorIndexDescriptor, VectorIndexError, VectorIndexStatus, VectorMutationConsistency,
-    VectorRecord, VectorResult, VectorRevision, VectorSearchRequest, VectorSearchResult,
+    VectorIndexChangeToken, VectorIndexDescriptor, VectorIndexError, VectorIndexStatus,
+    VectorMutationConsistency, VectorRecord, VectorResult, VectorRevision, VectorSearchRequest,
+    VectorSearchResult,
 };
 
 /// A bounded vector index whose content and lifecycle are owned by its caller.
@@ -15,6 +16,16 @@ pub trait VectorIndex: Send + Sync {
 
     /// Return the latest published status without waiting for background work.
     fn status(&self) -> VectorIndexStatus;
+
+    /// Return exact evidence for the current revision of one index history.
+    ///
+    /// The default preserves source compatibility but provides no continuity
+    /// proof. A backend may return `Some` only when every content mutation
+    /// advances the revision and its history identity changes whenever storage
+    /// is independently recreated or restored onto a divergent history.
+    fn change_token(&self) -> Option<VectorIndexChangeToken> {
+        None
+    }
 
     /// Return the strongest partition-mutation ordering contract implemented
     /// by this backend.

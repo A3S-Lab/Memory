@@ -142,6 +142,18 @@ conditional mutation until they implement it. CAS is intentionally global and
 may reject on unrelated partition churn. It is not a distributed lease, a
 durable remote backend, or permission to treat vectors as authoritative.
 
+`VectorIndex::change_token` is a separate optional continuity proof. A `Some`
+token binds one opaque index-history identity to the exact global revision.
+Every effective content mutation must advance that revision, while independent
+construction, divergent restore, or rollback must use a different history
+identity. This closes the ambiguity where two unrelated indexes can expose the
+same revision, record count, and byte count while containing different vectors.
+The in-memory index keeps one identity across clones and assigns a new identity
+at construction. Custom backends return `None`; a durable backend may retain an
+identity across process restarts only when its storage protocol preserves the
+same linear history. The token is content-free and is not a vector snapshot,
+lease, fencing authority, or durability proof by itself.
+
 ### Bounded operations
 
 Queries have validated finite limits. Change sets have a finite operation cap.
@@ -262,6 +274,7 @@ V1 remains source-compatible while V2 is introduced:
 
 - existing `MemoryStore` implementations continue to compile;
 - existing `MemoryRepository` implementations default to no change token;
+- existing `VectorIndex` implementations default to no change token;
 - existing `MemoryItem` serialization remains unchanged;
 - V2 uses new types rather than interpreting V1 string metadata as trusted
   typed fields;
@@ -302,6 +315,10 @@ The V2 kernel is not complete until tests prove:
 - built-in namespace change tokens advance atomically for novel successful
   changes, remain stable for replay/failure/access, stay namespace-isolated,
   reject an unsupported profile, and reconstruct exactly after file restart;
+- built-in vector change tokens bind one clone-shared history and revision,
+  advance on effective mutation, remain stable on no-op mutation, reject
+  malformed serialized evidence, and differ across independent indexes even
+  when their logical status collides;
 - the shared in-memory/file contract retrieves partial CJK phrases under the
   exact versioned lexical profile without adding single-character matching;
 - admission and use events are independently idempotent, and stale/inactive

@@ -1,8 +1,8 @@
 use super::search::search_snapshot;
 use super::{
-    VectorBudgetResource, VectorIndex, VectorIndexDescriptor, VectorIndexError, VectorIndexStatus,
-    VectorMutationConsistency, VectorNormalization, VectorRecord, VectorResult, VectorRevision,
-    VectorSearchRequest, VectorSearchResult,
+    VectorBudgetResource, VectorIndex, VectorIndexChangeToken, VectorIndexDescriptor,
+    VectorIndexError, VectorIndexStatus, VectorMutationConsistency, VectorNormalization,
+    VectorRecord, VectorResult, VectorRevision, VectorSearchRequest, VectorSearchResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -25,6 +25,7 @@ impl std::fmt::Debug for InMemoryVectorIndex {
 
 struct IndexInner {
     descriptor: VectorIndexDescriptor,
+    initial_change_token: VectorIndexChangeToken,
     snapshot: RwLock<Arc<IndexSnapshot>>,
 }
 
@@ -64,9 +65,14 @@ impl IndexSnapshot {
 impl InMemoryVectorIndex {
     pub fn new(descriptor: VectorIndexDescriptor) -> VectorResult<Self> {
         descriptor.validate()?;
+        let initial_change_token = VectorIndexChangeToken::try_new(
+            uuid::Uuid::new_v4().to_string(),
+            VectorRevision::default(),
+        )?;
         Ok(Self {
             inner: Arc::new(IndexInner {
                 descriptor,
+                initial_change_token,
                 snapshot: RwLock::new(Arc::new(IndexSnapshot::default())),
             }),
         })
@@ -85,6 +91,15 @@ impl VectorIndex for InMemoryVectorIndex {
 
     fn status(&self) -> VectorIndexStatus {
         self.snapshot().status()
+    }
+
+    fn change_token(&self) -> Option<VectorIndexChangeToken> {
+        let snapshot = self.snapshot();
+        Some(
+            self.inner
+                .initial_change_token
+                .with_revision(snapshot.revision),
+        )
     }
 
     fn mutation_consistency(&self) -> VectorMutationConsistency {

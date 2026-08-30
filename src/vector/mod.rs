@@ -14,7 +14,8 @@ mod tests;
 pub use in_memory::InMemoryVectorIndex;
 pub use index::VectorIndex;
 pub use types::{
-    VectorBudgetResource, VectorIndexDescriptor, VectorIndexError, VectorIndexStatus, VectorMetric,
-    VectorMutationConsistency, VectorNormalization, VectorRecord, VectorResult, VectorRevision,
-    VectorSearchHit, VectorSearchRequest, VectorSearchResult,
+    VectorBudgetResource, VectorIndexChangeToken, VectorIndexDescriptor, VectorIndexError,
+    VectorIndexStatus, VectorMetric, VectorMutationConsistency, VectorNormalization, VectorRecord,
+    VectorResult, VectorRevision, VectorSearchHit, VectorSearchRequest, VectorSearchResult,
+    VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1,
 };

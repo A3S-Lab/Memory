@@ -155,6 +155,80 @@ impl VectorRevision {
     }
 }
 
+/// Stable profile for exact vector-index history tokens.
+pub const VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1: &str = "a3s.memory.vector-index-change-token.v1";
+
+const MAX_VECTOR_INDEX_HISTORY_ID_BYTES: usize = 256;
+
+/// Exact revision evidence scoped to one vector-index history.
+///
+/// A durable backend must retain the same history identity only while it can
+/// guarantee that every revision still names the same linear mutation history.
+/// Recreated, restored, or independently initialized storage must use a new
+/// identity. Equality is therefore meaningful across process restarts only for
+/// a backend that durably preserves this contract.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VectorIndexChangeToken {
+    profile: String,
+    history_id: String,
+    revision: VectorRevision,
+}
+
+impl VectorIndexChangeToken {
+    /// Construct a token for a caller-owned index history.
+    pub fn try_new(history_id: impl Into<String>, revision: VectorRevision) -> VectorResult<Self> {
+        let token = Self {
+            profile: VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1.to_string(),
+            history_id: history_id.into(),
+            revision,
+        };
+        token.verify()?;
+        Ok(token)
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub fn history_id(&self) -> &str {
+        &self.history_id
+    }
+
+    pub fn revision(&self) -> VectorRevision {
+        self.revision
+    }
+
+    /// Verify the bounded public representation after deserialization.
+    pub fn verify(&self) -> VectorResult<()> {
+        if self.profile != VECTOR_INDEX_CHANGE_TOKEN_PROFILE_V1 {
+            return Err(VectorIndexError::InvalidChangeToken(
+                "profile is unsupported".to_string(),
+            ));
+        }
+        if self.history_id.is_empty()
+            || self.history_id.len() > MAX_VECTOR_INDEX_HISTORY_ID_BYTES
+            || self.history_id.trim() != self.history_id
+            || !self
+                .history_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || ".:_-".contains(character))
+        {
+            return Err(VectorIndexError::InvalidChangeToken(format!(
+                "history_id must contain 1 to {MAX_VECTOR_INDEX_HISTORY_ID_BYTES} ASCII identity characters"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn with_revision(&self, revision: VectorRevision) -> Self {
+        Self {
+            revision,
+            ..self.clone()
+        }
+    }
+}
+
 /// Strongest mutation ordering contract exposed by one vector backend.
 ///
 /// `IndexRevisionCas` means the backend compares the expected global index
@@ -252,6 +326,7 @@ pub enum VectorBudgetResource {
 pub enum VectorIndexError {
     InvalidDescriptor(String),
     InvalidRequest(String),
+    InvalidChangeToken(String),
     InvalidPartition,
     InvalidRecordId {
         partition: String,
@@ -302,6 +377,9 @@ impl fmt::Display for VectorIndexError {
                 write!(formatter, "invalid vector index: {message}")
             }
             Self::InvalidRequest(message) => write!(formatter, "invalid vector search: {message}"),
+            Self::InvalidChangeToken(message) => {
+                write!(formatter, "invalid vector index change token: {message}")
+            }
             Self::InvalidPartition => formatter.write_str("vector partition must not be empty"),
             Self::InvalidRecordId {
                 partition,
