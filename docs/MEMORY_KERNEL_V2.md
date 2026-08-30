@@ -21,6 +21,7 @@ transport.
 - idempotent and revision-checked atomic changes;
 - pure reads and queries;
 - complete bounded namespace snapshots for rebuilding caller-owned projections;
+- optional exact-namespace change tokens for suppressing redundant snapshots;
 - explicit admission and use records;
 - backend conformance and rebuildable derived indexes.
 
@@ -111,6 +112,23 @@ lexical, vector, or human-readable projections without making those projections
 authoritative. Custom backends construct responses through
 `MemoryNamespaceSnapshot::try_new`; consumers crossing a backend boundary call
 `verify` with the original request before trusting the snapshot identity.
+
+`namespace_change_token` is a separate optional pure read. A backend returning
+`Some` promises that every novel successful `apply` changing node state in
+the exact namespace publishes a different token at the same linearization
+point. Equal tokens therefore prove that the namespace did not change between
+the two reads. Sequences may jump but never repeat after a change. Idempotent
+replay, failed changes, admission, use, and reads do not advance them.
+Persistent backends retain or deterministically reconstruct the same token
+after restart. The token is content-free and scoped by the method call; it is
+not transferable across namespaces, backend histories, or repository
+instances.
+
+The default implementation validates the namespace and returns `None`.
+Consumers then retain the complete snapshot path. A token is only a
+change-detection accelerator: it is not a snapshot, source-completeness proof
+for an initial build, vector-index precondition, lock, distributed lease, or
+backend identity.
 
 The caller-owned `VectorIndex` exposes its mutation consistency separately from
 repository truth. `partition_atomic` guarantees that searches never observe a
@@ -243,6 +261,7 @@ active state.
 V1 remains source-compatible while V2 is introduced:
 
 - existing `MemoryStore` implementations continue to compile;
+- existing `MemoryRepository` implementations default to no change token;
 - existing `MemoryItem` serialization remains unchanged;
 - V2 uses new types rather than interpreting V1 string metadata as trusted
   typed fields;
@@ -280,6 +299,9 @@ The V2 kernel is not complete until tests prove:
 - namespace snapshots are complete, deterministically ordered and hashed, and
   reject node- or byte-over-budget views without truncation across every
   conforming backend;
+- built-in namespace change tokens advance atomically for novel successful
+  changes, remain stable for replay/failure/access, stay namespace-isolated,
+  reject an unsupported profile, and reconstruct exactly after file restart;
 - the shared in-memory/file contract retrieves partial CJK phrases under the
   exact versioned lexical profile without adding single-character matching;
 - admission and use events are independently idempotent, and stale/inactive

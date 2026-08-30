@@ -1,7 +1,8 @@
 use super::{
     MemoryAccessEvent, MemoryChangeResult, MemoryChangeSet, MemoryNamespace,
-    MemoryNamespaceSnapshot, MemoryNode, MemoryQuery, MemoryQueryResult, MemoryRepositoryError,
-    MemorySnapshotRequest, MemoryUsageSummary, MAX_QUERY_LIMIT,
+    MemoryNamespaceChangeToken, MemoryNamespaceSnapshot, MemoryNode, MemoryQuery,
+    MemoryQueryResult, MemoryRepositoryError, MemorySnapshotRequest, MemoryUsageSummary,
+    MAX_QUERY_LIMIT,
 };
 
 /// Repository contract for evidence-backed durable memory.
@@ -51,6 +52,21 @@ pub trait MemoryRepository: Send + Sync {
             request,
             result.hits.into_iter().map(|hit| hit.node).collect(),
         )
+    }
+
+    /// Return an optional exact-namespace change token.
+    ///
+    /// Some opts into the MemoryNamespaceChangeToken contract: every novel
+    /// successful apply that changes node state in this namespace must publish
+    /// a different token at the same linearization point. Tokens must remain
+    /// stable across reads, idempotent replay, access events, and durable
+    /// restart. Backends that cannot make those guarantees return None.
+    async fn namespace_change_token(
+        &self,
+        namespace: &MemoryNamespace,
+    ) -> Result<Option<MemoryNamespaceChangeToken>, MemoryRepositoryError> {
+        namespace.validate()?;
+        Ok(None)
     }
 
     /// Record that the host admitted the current active node revision into a model context.

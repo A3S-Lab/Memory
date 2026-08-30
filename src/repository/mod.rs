@@ -3,6 +3,7 @@
 mod access;
 mod change;
 mod change_engine;
+mod change_token;
 mod error;
 mod file;
 mod graph;
@@ -15,6 +16,7 @@ mod validation;
 
 pub use access::{MemoryAccessEvent, MemoryRepositorySnapshot, MemoryUsageSummary};
 pub use change::{MemoryChangeResult, MemoryChangeSet, MemoryOperation};
+pub use change_token::{MemoryNamespaceChangeToken, MEMORY_NAMESPACE_CHANGE_TOKEN_PROFILE_V1};
 pub use error::MemoryRepositoryError;
 pub use file::FileMemoryRepository;
 pub use in_memory::InMemoryRepository;

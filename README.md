@@ -47,6 +47,18 @@ and rejects a node- or canonical-byte-over-budget view instead of silently
 truncating it. Snapshot responses can be recomputed against their original
 request, so hosts need not trust a custom backend's claimed digest.
 
+Backends may additionally opt into
+`MemoryRepository::namespace_change_token`. Equal bounded tokens prove that
+no novel successful change set altered that exact namespace between two reads,
+allowing callers to avoid a redundant snapshot without weakening their normal
+snapshot and publication proofs. Tokens contain only a versioned monotonic
+sequence; they do not contain namespace identifiers or memory content.
+`InMemoryRepository` updates the sequence at the same write-lock
+linearization point as node state, and `FileMemoryRepository` reconstructs the
+same sequence by journal replay. Idempotent replay, failed changes, admission,
+and use do not advance it. Custom backends return `None` unless they explicitly
+implement the contract.
+
 The deterministic V2 lexical profile preserves lowercased alphanumeric words
 and adds overlapping bigrams for contiguous Chinese, Japanese, and Korean text.
 This makes ordinary same-language CJK phrase variation searchable without a
@@ -243,6 +255,10 @@ namespace isolation, evidence admission, idempotent replay, atomic rollback,
 revision preservation, pure queries, explicit usage records, bounded input,
 complete namespace-snapshot identity and overflow behavior, deterministic
 word/CJK-bigram retrieval across both V2 backends, and concurrent writers.
+The optional namespace change-token suite additionally covers atomic
+advancement, namespace isolation, idempotent and failed writes, access-event
+stability, concurrent single-winner updates, restart reconstruction, tamper
+rejection, redaction, and source-compatible custom-backend opt-in.
 Enabling the `sqlite` feature also runs the SQLite V1 backend contract.
 
 ```sh

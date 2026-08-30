@@ -4,8 +4,9 @@ use super::snapshot::snapshot_from_map;
 use super::validation::{validate_required_text, MAX_IDENTIFIER_BYTES};
 use super::{
     MemoryAccessEvent, MemoryChangeResult, MemoryChangeSet, MemoryNamespace,
-    MemoryNamespaceSnapshot, MemoryNode, MemoryQuery, MemoryQueryResult, MemoryRepository,
-    MemoryRepositoryError, MemoryRepositorySnapshot, MemorySnapshotRequest, MemoryUsageSummary,
+    MemoryNamespaceChangeToken, MemoryNamespaceSnapshot, MemoryNode, MemoryQuery,
+    MemoryQueryResult, MemoryRepository, MemoryRepositoryError, MemoryRepositorySnapshot,
+    MemorySnapshotRequest, MemoryUsageSummary,
 };
 use std::collections::BTreeMap;
 use tokio::sync::RwLock;
@@ -19,6 +20,7 @@ struct AppliedChange {
 #[derive(Debug, Default)]
 struct RepositoryState {
     nodes: BTreeMap<MemoryNamespace, BTreeMap<String, MemoryNode>>,
+    namespace_change_sequences: BTreeMap<MemoryNamespace, u64>,
     applied_changes: BTreeMap<MemoryNamespace, BTreeMap<String, AppliedChange>>,
     admissions: BTreeMap<MemoryNamespace, BTreeMap<String, MemoryAccessEvent>>,
     uses: BTreeMap<MemoryNamespace, BTreeMap<String, MemoryAccessEvent>>,
@@ -156,11 +158,21 @@ impl MemoryRepository for InMemoryRepository {
         change_set: MemoryChangeSet,
     ) -> Result<MemoryChangeResult, MemoryRepositoryError> {
         let mut state = self.state.write().await;
-        let PreparedChange { result, staged } = prepare_change(&state, &change_set)?;
+        let PreparedChange {
+            result,
+            staged,
+            next_change_sequence,
+        } = prepare_change(&state, &change_set)?;
         let Some(mut staged) = staged else {
             return Ok(result);
         };
-        let namespace_nodes = state.nodes.entry(change_set.namespace.clone()).or_default();
+        let next_change_sequence = next_change_sequence.ok_or_else(|| {
+            MemoryRepositoryError::invariant(
+                "novel memory change did not reserve a namespace change sequence",
+            )
+        })?;
+        let namespace = change_set.namespace.clone();
+        let namespace_nodes = state.nodes.entry(namespace.clone()).or_default();
         for node_id in &staged.changed {
             let node = staged.nodes.remove(node_id).ok_or_else(|| {
                 MemoryRepositoryError::invariant(format!(
@@ -171,7 +183,7 @@ impl MemoryRepository for InMemoryRepository {
         }
         state
             .applied_changes
-            .entry(change_set.namespace.clone())
+            .entry(namespace.clone())
             .or_default()
             .insert(
                 change_set.idempotency_key.clone(),
@@ -180,6 +192,9 @@ impl MemoryRepository for InMemoryRepository {
                     result: result.clone(),
                 },
             );
+        state
+            .namespace_change_sequences
+            .insert(namespace, next_change_sequence);
         Ok(result)
     }
 
@@ -211,6 +226,20 @@ impl MemoryRepository for InMemoryRepository {
         request.validate()?;
         let state = self.state.read().await;
         snapshot_from_map(state.nodes.get(&request.namespace), request)
+    }
+
+    async fn namespace_change_token(
+        &self,
+        namespace: &MemoryNamespace,
+    ) -> Result<Option<MemoryNamespaceChangeToken>, MemoryRepositoryError> {
+        namespace.validate()?;
+        let state = self.state.read().await;
+        let sequence = state
+            .namespace_change_sequences
+            .get(namespace)
+            .copied()
+            .unwrap_or(0);
+        Ok(Some(MemoryNamespaceChangeToken::new(sequence)))
     }
 
     async fn record_admission(
@@ -254,6 +283,7 @@ impl MemoryRepository for InMemoryRepository {
 struct PreparedChange {
     result: MemoryChangeResult,
     staged: Option<StagedChange>,
+    next_change_sequence: Option<u64>,
 }
 
 fn prepare_change(
@@ -270,6 +300,7 @@ fn prepare_change(
             Ok(PreparedChange {
                 result: applied.result.clone(),
                 staged: None,
+                next_change_sequence: None,
             })
         } else {
             Err(MemoryRepositoryError::IdempotencyConflict {
@@ -279,6 +310,14 @@ fn prepare_change(
     }
 
     let staged = stage_change_set(change_set, state.nodes.get(&change_set.namespace))?;
+    let current_change_sequence = state
+        .namespace_change_sequences
+        .get(&change_set.namespace)
+        .copied()
+        .unwrap_or(0);
+    let next_change_sequence = current_change_sequence
+        .checked_add(1)
+        .ok_or_else(|| MemoryRepositoryError::invariant("namespace change sequence overflowed"))?;
     let result = MemoryChangeResult {
         idempotency_key: change_set.idempotency_key.clone(),
         occurred_at: change_set.occurred_at,
@@ -291,6 +330,7 @@ fn prepare_change(
     Ok(PreparedChange {
         result,
         staged: Some(staged),
+        next_change_sequence: Some(next_change_sequence),
     })
 }
 
