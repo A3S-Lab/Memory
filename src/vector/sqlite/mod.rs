@@ -1,4 +1,5 @@
 mod codec;
+mod identity;
 mod mutation;
 mod snapshot;
 mod storage;
@@ -20,7 +21,9 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// so revision-conditioned partition replacement has one global
 /// linearization point. The synchronous status accessors are cached
 /// compatibility views; use [`VectorIndex::observe`] for current durable
-/// evidence.
+/// evidence. On Unix and Windows, copying or atomically replacing the closed
+/// database forks its history token on the next open. In-place overwrite and
+/// concurrent out-of-band file operations are not supported.
 #[derive(Clone)]
 pub struct SqliteVectorIndex {
     inner: Arc<IndexInner>,

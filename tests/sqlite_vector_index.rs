@@ -240,6 +240,45 @@ async fn no_op_mutations_preserve_revision_and_token_across_reopen() {
 }
 
 #[tokio::test]
+async fn copying_a_database_forks_its_history_identity_without_changing_content() {
+    let directory = TempDir::new().unwrap();
+    let source_path = database_path(&directory);
+    let copy_path = directory.path().join("vectors-copy.sqlite3");
+    let descriptor = VectorIndexDescriptor::new(2);
+    let source = SqliteVectorIndex::open(&source_path, descriptor.clone())
+        .await
+        .unwrap();
+    source
+        .replace_partition("semantic", vec![record("alpha", [1.0, 0.0])])
+        .await
+        .unwrap();
+    let source_observation = source.observe().await.unwrap();
+    drop(source);
+
+    std::fs::copy(&source_path, &copy_path).unwrap();
+    let copied = SqliteVectorIndex::open(&copy_path, descriptor.clone())
+        .await
+        .unwrap();
+    let copied_observation = copied.observe().await.unwrap();
+    assert_eq!(copied_observation.status, source_observation.status);
+    assert_ne!(
+        copied_observation.change_token, source_observation.change_token,
+        "an independently writable file must not retain the source history identity"
+    );
+    let copied_result = copied
+        .search(VectorSearchRequest::new(vec![1.0, 0.0], 1))
+        .await
+        .unwrap();
+    assert_eq!(copied_result.hits[0].id, "alpha");
+    drop(copied);
+
+    let source = SqliteVectorIndex::open(&source_path, descriptor)
+        .await
+        .unwrap();
+    assert_eq!(source.observe().await.unwrap(), source_observation);
+}
+
+#[tokio::test]
 async fn durable_and_in_memory_indexes_share_stable_logical_byte_accounting() {
     let directory = TempDir::new().unwrap();
     let path = database_path(&directory);

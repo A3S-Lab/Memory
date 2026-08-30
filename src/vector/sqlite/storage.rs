@@ -4,12 +4,13 @@ use super::super::{
     VectorIndexChangeToken, VectorIndexDescriptor, VectorIndexError, VectorIndexObservation,
     VectorIndexStatus, VectorResult, VectorRevision, VectorSearchRequest, VectorSearchResult,
 };
+use super::identity::storage_identity;
 use super::snapshot::load_snapshot;
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::Path;
 use std::time::Duration;
 
-const STORAGE_PROFILE: &str = "a3s.memory.sqlite-vector-index.v1";
+const STORAGE_PROFILE: &str = "a3s.memory.sqlite-vector-index.v2";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCHEMA: &str = r#"
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS a3s_vector_index_metadata (
     storage_profile TEXT    NOT NULL,
     descriptor_json TEXT    NOT NULL,
     history_digest  TEXT    NOT NULL,
+    storage_identity TEXT   NOT NULL,
     revision        TEXT    NOT NULL,
     partition_count INTEGER NOT NULL CHECK (partition_count >= 0),
     record_count    INTEGER NOT NULL CHECK (record_count >= 0),
@@ -60,6 +62,7 @@ pub(super) fn open(
     connection.execute_batch(SCHEMA).map_err(|_| {
         VectorIndexError::StorageFailed("could not initialize the SQLite schema".to_string())
     })?;
+    let identity = storage_identity(path)?;
 
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -68,7 +71,9 @@ pub(super) fn open(
                 "could not start SQLite index initialization".to_string(),
             )
         })?;
-    initialize_metadata(&transaction, descriptor)?;
+    initialize_metadata(&transaction, descriptor, &identity)?;
+    let current = read_observation(&transaction, descriptor)?;
+    reconcile_storage_identity(&transaction, &current, &identity)?;
     let (_, observation) = load_snapshot(&transaction, descriptor)?;
     transaction.commit().map_err(|_| {
         VectorIndexError::StorageFailed("could not finish SQLite index initialization".to_string())
@@ -118,6 +123,7 @@ pub(super) fn search(
 fn initialize_metadata(
     connection: &Connection,
     descriptor: &VectorIndexDescriptor,
+    storage_identity: &str,
 ) -> VectorResult<()> {
     let metadata_count: i64 = connection
         .query_row(
@@ -147,10 +153,15 @@ fn initialize_metadata(
     connection
         .execute(
             "INSERT INTO a3s_vector_index_metadata
-             (singleton, storage_profile, descriptor_json, history_digest, revision,
+             (singleton, storage_profile, descriptor_json, history_digest, storage_identity, revision,
               partition_count, record_count, byte_count)
-             VALUES (1, ?1, ?2, ?3, '0', 0, 0, 0)",
-            params![STORAGE_PROFILE, descriptor_json, new_history_digest()],
+             VALUES (1, ?1, ?2, ?3, ?4, '0', 0, 0, 0)",
+            params![
+                STORAGE_PROFILE,
+                descriptor_json,
+                new_history_digest(),
+                storage_identity
+            ],
         )
         .map_err(|_| {
             VectorIndexError::StorageFailed("could not create SQLite index metadata".to_string())
@@ -164,7 +175,7 @@ pub(super) fn read_observation(
 ) -> VectorResult<VectorIndexObservation> {
     let raw = connection
         .query_row(
-            "SELECT storage_profile, descriptor_json, history_digest, revision,
+            "SELECT storage_profile, descriptor_json, history_digest, storage_identity, revision,
                     partition_count, record_count, byte_count
              FROM a3s_vector_index_metadata WHERE singleton = 1",
             [],
@@ -173,10 +184,11 @@ pub(super) fn read_observation(
                     storage_profile: row.get(0)?,
                     descriptor_json: row.get(1)?,
                     history_digest: row.get(2)?,
-                    revision: row.get(3)?,
-                    partition_count: row.get(4)?,
-                    record_count: row.get(5)?,
-                    byte_count: row.get(6)?,
+                    storage_identity: row.get(3)?,
+                    revision: row.get(4)?,
+                    partition_count: row.get(5)?,
+                    record_count: row.get(6)?,
+                    byte_count: row.get(7)?,
                 })
             },
         )
@@ -188,6 +200,9 @@ pub(super) fn read_observation(
         })?;
     if raw.storage_profile != STORAGE_PROFILE {
         return Err(corrupted("storage profile is unsupported"));
+    }
+    if !valid_digest(&raw.storage_identity) {
+        return Err(corrupted("stored file identity is invalid"));
     }
     let stored_descriptor: VectorIndexDescriptor = serde_json::from_str(&raw.descriptor_json)
         .map_err(|_| corrupted("stored descriptor is not valid JSON"))?;
@@ -287,6 +302,43 @@ pub(super) fn table_count(connection: &Connection, table: &str) -> VectorResult<
     nonnegative_usize(count, "table row count")
 }
 
+fn reconcile_storage_identity(
+    connection: &Connection,
+    observation: &VectorIndexObservation,
+    current_identity: &str,
+) -> VectorResult<()> {
+    let stored_identity: String = connection
+        .query_row(
+            "SELECT storage_identity FROM a3s_vector_index_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            VectorIndexError::StorageFailed("could not read SQLite file identity".to_string())
+        })?;
+    if stored_identity == current_identity {
+        return Ok(());
+    }
+    let changed = connection
+        .execute(
+            "UPDATE a3s_vector_index_metadata
+             SET history_digest = ?1, storage_identity = ?2
+             WHERE singleton = 1 AND revision = ?3",
+            params![
+                new_history_digest(),
+                current_identity,
+                observation.status.revision.value().to_string()
+            ],
+        )
+        .map_err(|_| {
+            VectorIndexError::StorageFailed("could not fork SQLite index history".to_string())
+        })?;
+    if changed != 1 {
+        return Err(corrupted("file-identity reconciliation lost its revision"));
+    }
+    Ok(())
+}
+
 pub(super) fn nonnegative_usize(value: i64, name: &str) -> VectorResult<usize> {
     usize::try_from(value).map_err(|_| corrupted(&format!("{name} is outside the valid range")))
 }
@@ -299,10 +351,20 @@ pub(super) fn corrupted(message: &str) -> VectorIndexError {
     VectorIndexError::StorageCorrupted(message.to_string())
 }
 
+fn valid_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
 struct RawMetadata {
     storage_profile: String,
     descriptor_json: String,
     history_digest: String,
+    storage_identity: String,
     revision: String,
     partition_count: i64,
     record_count: i64,

@@ -143,7 +143,12 @@ point. Custom backends default to source-compatible atomic replacement and
 reject conditional mutation until they implement it. CAS is intentionally
 global and may reject on unrelated partition churn. The SQLite backend is not
 a distributed lease, a durable remote backend, or permission to treat vectors
-as authoritative.
+as authoritative. On Unix and Windows, it binds the persisted history digest
+to the database file identity. A copied or atomically replaced database keeps
+its content revision but receives a new history digest on first open. Restore
+therefore requires a closed database and file replacement; in-place overwrite
+and concurrent out-of-band file operations are outside the storage protocol.
+Targets without a stable file identity conservatively fork on every open.
 
 `VectorIndex::change_token` is a separate optional continuity proof. A `Some`
 token binds one canonical opaque SHA-256 index-history digest to the exact
@@ -154,11 +159,11 @@ digest. This closes the ambiguity where two unrelated indexes can expose the
 same revision, record count, and byte count while containing different vectors.
 The in-memory index keeps one digest across clones and assigns a new digest at
 construction. The SQLite index persists one digest alongside the descriptor
-and advances its revision in the same transaction as content. Custom backends
-return `None`; another durable backend may retain a digest across process
-restarts only when its storage protocol preserves the same linear history. The
-token is content-free and is not a vector snapshot, lease, fencing authority,
-or durability proof by itself.
+and file identity, and advances its revision in the same transaction as
+content. Custom backends return `None`; another durable backend may retain a
+digest across process restarts only when its storage protocol preserves the
+same linear history. The token is content-free and is not a vector snapshot,
+lease, fencing authority, or durability proof by itself.
 
 `VectorIndex::observe` is the correctness API for reading status and optional
 history evidence together. Built-in backends return one exact observation;

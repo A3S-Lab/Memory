@@ -210,8 +210,14 @@ digests, and vector rows in one SQLite database. Mutations use `IMMEDIATE`
 transactions, so independent processes share one global revision-CAS
 linearization point. Reopen validates the descriptor, accounting, record
 shape, and integrity digests before serving; mismatches and corruption fail
-closed. Blocking SQLite work runs on Tokio's blocking pool. This is local
-durability and fencing, not a distributed lease or remote replicated store.
+closed. On Unix and Windows, the history identity is also bound to the database
+file identity: copying or atomically replacing the file forks the token on its
+next open without changing its content revision. Backup restore must replace
+the closed database file; in-place overwrite and concurrent out-of-band file
+operations are unsupported. Other targets conservatively fork the token on
+every open when a stable file identity is unavailable. Blocking SQLite work
+runs on Tokio's blocking pool. This is local durability and fencing, not a
+distributed lease or remote replicated store.
 
 ```rust
 use a3s_memory::{SqliteVectorIndex, VectorIndex, VectorIndexDescriptor};
