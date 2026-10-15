@@ -490,18 +490,45 @@ fn memory_type_to_query_key(memory_type: MemoryType) -> &'static str {
 }
 
 fn query_terms(query: &str) -> Vec<String> {
-    let mut terms: Vec<String> = query
+    let mut terms: Vec<String> = Vec::new();
+    for token in query
         .to_lowercase()
         .split(|ch: char| {
             !(ch.is_alphanumeric() || matches!(ch, '/' | '\\' | '_' | '-' | '.' | ':' | '@'))
         })
         .map(str::trim)
-        .filter(|term| term.chars().count() >= 2)
-        .map(ToOwned::to_owned)
-        .collect();
+    {
+        if token.chars().count() < 2 {
+            continue;
+        }
+        terms.push(token.to_owned());
+        // Unspaced scripts (CJK) arrive as one long token, so whole-token
+        // containment almost never matches a differently-phrased memory.
+        // Character bigrams are the standard lexical bridge: a paraphrase
+        // shares substrings even when it shares no whole token. Latin
+        // tokens skip this — they are already word-shaped.
+        let has_cjk = token.chars().any(is_cjk);
+        if has_cjk {
+            let chars: Vec<char> = token.chars().collect();
+            for window in chars.windows(2) {
+                terms.push(window.iter().collect());
+            }
+        }
+    }
     terms.sort();
     terms.dedup();
     terms
+}
+
+/// True for Han, Hiragana, Katakana, Hangul, and CJK punctuation-adjacent
+/// scripts — the unspaced writing systems this bridging targets.
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x4E00..=0x9FFF   // CJK Unified Ideographs
+        | 0x3400..=0x4DBF // Extension A
+        | 0x3040..=0x30FF // Hiragana + Katakana
+        | 0xAC00..=0xD7AF // Hangul syllables
+    )
 }
 
 fn lexical_match_score(
@@ -818,12 +845,65 @@ pub struct FileMemoryStore {
     items_dir: std::path::PathBuf,
     index_path: std::path::PathBuf,
     index: RwLock<Vec<IndexEntry>>,
+    /// Per-process access counts. Reads must stay read-only, so the running
+    /// count lives here and persists to the item file exactly once — when
+    /// it crosses the prune-protection threshold, the only transition that
+    /// changes behavior. A fresh process resumes from the persisted value.
+    access_counts: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 static FILE_MEMORY_INDEX_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn file_memory_index_lock() -> &'static tokio::sync::Mutex<()> {
     FILE_MEMORY_INDEX_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Tighten a memory state directory to 0700 when it leaks group/other bits.
+/// A symlink path is left untouched — a linked directory is another tool's
+/// surface. Mirrors the a3s-code `secure_state` pattern so the crate stays
+/// dependency-free.
+fn restrict_memory_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(());
+        }
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(path, permissions)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Restrict a memory state file to 0600, right after creation and before the
+/// atomic rename publishes it.
+fn restrict_memory_file(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Ok(());
+        }
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o777 != 0o600 {
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(path, permissions)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 impl FileMemoryStore {
@@ -836,6 +916,17 @@ impl FileMemoryStore {
             .await
             .with_context(|| {
                 format!("Failed to create memory directory: {}", items_dir.display())
+            })?;
+        // Durable memory carries everything the agent was told; refuse to
+        // leave the tree group- or other-readable, including pre-existing
+        // loose directories opened by this handle.
+        restrict_memory_dir(&dir)
+            .and_then(|()| restrict_memory_dir(&items_dir))
+            .with_context(|| {
+                format!(
+                    "Failed to restrict memory directory: {}",
+                    items_dir.display()
+                )
             })?;
 
         let index = if index_path.exists() {
@@ -853,6 +944,7 @@ impl FileMemoryStore {
             items_dir,
             index_path,
             index: RwLock::new(index),
+            access_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -894,6 +986,7 @@ impl FileMemoryStore {
         tokio::fs::write(&tmp, json.as_bytes())
             .await
             .context("Failed to write memory index temp file")?;
+        restrict_memory_file(&tmp).context("Failed to restrict memory index temp file")?;
         tokio::fs::rename(&tmp, &self.index_path)
             .await
             .context("Failed to rename memory index")?;
@@ -909,10 +1002,16 @@ impl FileMemoryStore {
         let path = self.item_path(&item.id);
         let json = serde_json::to_string_pretty(item)
             .with_context(|| format!("Failed to serialize memory item: {}", item.id))?;
-        let tmp = path.with_extension("json.tmp");
+        // A unique temp name matters as much as it does for the index: two
+        // concurrent writers touching the same item (an extraction worker
+        // and an access-counter persist from a reopened store) would
+        // otherwise consume each other's temp file between write and rename.
+        let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
         tokio::fs::write(&tmp, json.as_bytes())
             .await
             .with_context(|| format!("Failed to write memory item: {}", item.id))?;
+        restrict_memory_file(&tmp)
+            .with_context(|| format!("Failed to restrict memory item: {}", item.id))?;
         tokio::fs::rename(&tmp, &path)
             .await
             .with_context(|| format!("Failed to rename memory item: {}", item.id))?;
@@ -1009,8 +1108,24 @@ impl MemoryStore for FileMemoryStore {
         let data = tokio::fs::read_to_string(&path).await?;
         let mut item: MemoryItem = serde_json::from_str(&data)?;
         item.content_lower = item.content.to_lowercase();
-        item.record_access();
-        self.save_item(&item).await?;
+        // Access counters feed prune protection and duplicate merging, never
+        // ranking — a read must not cost a write. The running count lives in
+        // the per-process ledger and persists exactly once, at the
+        // protection-threshold crossing.
+        let total_accesses = {
+            let mut ledger = self
+                .access_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let count = ledger.entry(id.to_owned()).or_insert(item.access_count);
+            *count += 1;
+            *count
+        };
+        item.access_count = total_accesses;
+        item.last_accessed = Some(Utc::now());
+        if total_accesses == PRUNE_PROTECTED_ACCESS_COUNT {
+            self.save_item(&item).await?;
+        }
         Ok(Some(item))
     }
 
@@ -1226,6 +1341,65 @@ impl MemoryStore for FileMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_terms_emits_cjk_bigrams_for_unspaced_scripts() {
+        // A Chinese sentence arrives as ONE token; the bigrams let a
+        // differently-phrased memory match on shared substrings.
+        let terms = query_terms("那个代号是什么");
+        assert!(
+            terms.contains(&"代号".to_string()) && terms.contains(&"什么".to_string()),
+            "bigrams present: {terms:?}"
+        );
+        assert!(
+            terms.contains(&"那个代号是什么".to_string()),
+            "full token kept"
+        );
+        // Latin words pass through unchanged — no per-letter noise.
+        let terms = query_terms("codename falcon");
+        assert_eq!(terms, vec!["codename".to_string(), "falcon".to_string()]);
+        // Lone CJK characters stay below the term floor (matching 是 alone
+        // would be noise); a 2-char token is its own single bigram.
+        assert!(query_terms("是").is_empty());
+        let terms = query_terms("代号");
+        assert_eq!(terms, vec!["代号".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn chinese_paraphrase_recalls_through_the_lexical_store() {
+        // The recall side of the i18n gap (Code#188 fixed persistence;
+        // recall was lexical and cross-script queries missed entirely).
+        let store = InMemoryStore::new();
+        MemoryStore::store(
+            &store,
+            MemoryItem::new("请记住:我的代号是 Y9-KESTREL-CODE。这是长期个人偏好,以后回答时引用。")
+                .with_importance(0.9),
+        )
+        .await
+        .unwrap();
+        // A DIFFERENT phrasing, same script, shared substrings only.
+        let hits = store.search("那个代号是什么来着", 5).await.unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.content.contains("Y9-KESTREL-CODE")),
+            "paraphrase recall must reach the stored memory: {:?}",
+            hits.iter()
+                .map(|hit| hit.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        // Negative: unrelated Chinese shares no bigram with the memory.
+        let misses = store.search("仓库里有七个铜桶", 5).await.unwrap();
+        assert!(
+            misses
+                .iter()
+                .all(|hit| !hit.content.contains("Y9-KESTREL-CODE")),
+            "unrelated query must not recall: {:?}",
+            misses
+                .iter()
+                .map(|hit| hit.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
 
     // MemoryItem tests
 
@@ -1610,6 +1784,7 @@ mod tests {
 #[cfg(test)]
 mod file_memory_store_tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, FileMemoryStore) {
@@ -1668,19 +1843,32 @@ mod file_memory_store_tests {
     }
 
     #[tokio::test]
-    async fn test_retrieve_records_access_on_disk() {
+    async fn test_retrieve_counts_access_in_memory_and_persists_at_the_threshold() {
         let (dir, store) = setup().await;
         let item = MemoryItem::new("access me");
         let id = item.id.clone();
         store.store(item).await.unwrap();
 
+        // Sub-threshold accesses are counted on the returned item but do
+        // not rewrite the item file.
         let item = store.retrieve(&id).await.unwrap().unwrap();
         assert_eq!(item.access_count, 1);
+        assert!(item.last_accessed.is_some());
+        let item = store.retrieve(&id).await.unwrap().unwrap();
+        assert_eq!(item.access_count, 2);
+
+        // The prune-protection crossing is durable.
+        let item = store.retrieve(&id).await.unwrap().unwrap();
+        assert_eq!(item.access_count, PRUNE_PROTECTED_ACCESS_COUNT);
+        drop(store);
 
         let reopened = FileMemoryStore::new(dir.path()).await.unwrap();
         let item = reopened.retrieve(&id).await.unwrap().unwrap();
-        assert_eq!(item.access_count, 2);
-        assert!(item.last_accessed.is_some());
+        assert!(
+            item.access_count > PRUNE_PROTECTED_ACCESS_COUNT,
+            "the threshold crossing must be durable: {}",
+            item.access_count
+        );
     }
 
     #[tokio::test]
@@ -1818,6 +2006,149 @@ mod file_memory_store_tests {
         let reopened = FileMemoryStore::new(dir.path()).await.unwrap();
         assert_eq!(reopened.count().await.unwrap(), 2);
         assert_eq!(reopened.search("stale merge", 10).await.unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_tree_is_created_private_and_reopened_trees_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let store = FileMemoryStore::new(dir.path()).await.unwrap();
+        store
+            .store(MemoryItem::new("private durable preference"))
+            .await
+            .unwrap();
+        drop(store);
+
+        let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode(&dir.path().join("items")) & 0o777, 0o700);
+        let item_path = dir
+            .path()
+            .join("items")
+            .read_dir()
+            .unwrap()
+            .next()
+            .and_then(|entry| entry.ok())
+            .expect("stored item file")
+            .path();
+        assert_eq!(mode(&item_path) & 0o777, 0o600);
+        assert_eq!(mode(&dir.path().join("index.json")) & 0o777, 0o600);
+
+        // A pre-existing loose tree is tightened on reopen, never silently
+        // accepted.
+        let loose = TempDir::new().unwrap();
+        let items = loose.path().join("items");
+        std::fs::create_dir_all(&items).unwrap();
+        std::fs::set_permissions(&items, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(items.join("legacy.json"), "{}").unwrap();
+        std::fs::set_permissions(
+            items.join("legacy.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let _store = FileMemoryStore::new(loose.path()).await.unwrap();
+        assert_eq!(mode(&items) & 0o777, 0o700);
+        assert_eq!(mode(&items.join("legacy.json")) & 0o777, 0o644);
+    }
+
+    #[tokio::test]
+    async fn retrieves_stay_read_only_except_at_the_prune_protection_crossing() {
+        let dir = TempDir::new().unwrap();
+        let store = FileMemoryStore::new(dir.path()).await.unwrap();
+        let stored = store
+            .store_and_return(MemoryItem::new("frequently recalled durable preference"))
+            .await
+            .unwrap();
+        let item_path = dir.path().join("items").join(format!("{}.json", stored.id));
+
+        // Sub-threshold and post-threshold retrieves must not rewrite the
+        // item: compare the serialized counter on disk instead of mtimes so
+        // the pin does not depend on timestamp resolution.
+        let disk_counter = || {
+            let raw = std::fs::read_to_string(&item_path).unwrap();
+            serde_json::from_str::<MemoryItem>(&raw)
+                .unwrap()
+                .access_count
+        };
+
+        // Every access below the protection threshold stays read-only.
+        let baseline = disk_counter();
+        while {
+            let item = store.retrieve(&stored.id).await.unwrap().unwrap();
+            item.access_count < PRUNE_PROTECTED_ACCESS_COUNT
+        } {
+            assert_eq!(
+                disk_counter(),
+                baseline,
+                "sub-threshold retrieves must stay read-only"
+            );
+        }
+
+        // The crossing write already happened inside the loop: the disk now
+        // carries the threshold value while the ledger keeps counting.
+        assert_eq!(
+            disk_counter(),
+            PRUNE_PROTECTED_ACCESS_COUNT,
+            "the protection crossing must persist the counter"
+        );
+
+        // Beyond the threshold, retrieves are read-only again.
+        let item = store.retrieve(&stored.id).await.unwrap().unwrap();
+        assert_eq!(item.access_count, PRUNE_PROTECTED_ACCESS_COUNT + 1);
+        assert_eq!(
+            disk_counter(),
+            PRUNE_PROTECTED_ACCESS_COUNT,
+            "post-threshold retrieves must stay read-only"
+        );
+
+        // The persisted counter survives a reopen.
+        drop(store);
+        let reopened = FileMemoryStore::new(dir.path()).await.unwrap();
+        let item = reopened.retrieve(&stored.id).await.unwrap().unwrap();
+        assert!(
+            item.access_count >= PRUNE_PROTECTED_ACCESS_COUNT,
+            "the crossing write must be durable: {}",
+            item.access_count
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_of_one_item_never_lose_the_temp_file() {
+        // Extraction workers and access-counter persists from a reopened
+        // store can race on the same item id. With a fixed temp name one
+        // writer's rename consumed the other's temp file between write and
+        // rename ("Failed to rename memory item"). Unique temp names make
+        // the collision structurally impossible.
+        let dir = TempDir::new().unwrap();
+        let mut opened = Vec::new();
+        for _ in 0..8 {
+            opened.push(Arc::new(FileMemoryStore::new(dir.path()).await.unwrap()));
+        }
+        let item = MemoryItem::new("raced durable preference codename");
+        let stores = Arc::new(opened);
+        let mut writers = Vec::new();
+        for writer in 0..16u32 {
+            let stores = Arc::clone(&stores);
+            let mut raced = item.clone();
+            raced.importance = 0.5 + (writer % 8) as f32 / 16.0;
+            writers.push(tokio::spawn(async move {
+                let store = Arc::clone(&stores[(writer as usize) % stores.len()]);
+                store.store(raced).await
+            }));
+        }
+        for writer in writers {
+            writer
+                .await
+                .unwrap()
+                .expect("racing same-id save must succeed");
+        }
+        let items = stores[0]
+            .search("raced durable preference", 10)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1, "one item survives the write race");
+        assert!(stores[0].count().await.unwrap() >= 1);
     }
 
     #[tokio::test]
